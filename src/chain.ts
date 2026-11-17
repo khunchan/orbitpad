@@ -3,6 +3,7 @@ import {
   createWalletClient,
   custom,
   encodeFunctionData,
+  formatUnits,
   defineChain,
   erc20Abi,
   fallback,
@@ -156,6 +157,91 @@ export async function requireWallet(): Promise<{ client: WalletClient; account: 
   return { client: wallet.client, account: wallet.account };
 }
 
+// ---------- Read-after-write consistency ----------
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+/** Highest block of a confirmed transaction of ours; reads must not be served from an older block. */
+let minReadBlock = 0n;
+
+/** Latest block number, waiting (with backoff) until the RPC has caught up with our last receipt. */
+export async function freshBlockNumber(): Promise<bigint> {
+  for (let attempt = 0; ; attempt++) {
+    const head = await publicClient.getBlockNumber({ cacheTime: 0 });
+    if (head >= minReadBlock) return head;
+    if (attempt >= 12) throw new Error(`RPC is still behind block ${minReadBlock}; retry in a moment`);
+    await sleep(Math.min(4_000, 300 * 2 ** attempt));
+  }
+}
+
+const isLagError = (error: unknown) =>
+  /header not found|unknown block|block not found|missing trie|not available|RPC Request failed|timed out/i.test(String((error as Error)?.message ?? error));
+
+/** Runs a read pinned to `block` (default: a fresh block), retrying while the RPC lags behind it. */
+export async function readAt<T>(fn: (block: bigint) => Promise<T>, block?: bigint): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn(block ?? (await freshBlockNumber()));
+    } catch (error) {
+      if (attempt >= 5 || !isLagError(error)) throw error;
+      await sleep(400 * 2 ** attempt);
+    }
+  }
+}
+
+type WatchedToken = { address: Address; symbol: string; decimals: number };
+const watched = new Map<string, WatchedToken>();
+/** Tokens whose balance change is reported after each transaction (WETH is always included). */
+export function watchToken(address: Address, symbol: string, decimals: number) {
+  watched.set(address.toLowerCase(), { address, symbol, decimals });
+}
+
+export type TxConfirmed = { receipt: TransactionReceipt; label: string };
+const txListeners = new Set<(event: TxConfirmed) => void>();
+export const onTxConfirmed = (fn: (event: TxConfirmed) => void) => txListeners.add(fn);
+
+const formatDelta = (raw: bigint, decimals: number) => {
+  const text = formatUnits(raw < 0n ? -raw : raw, decimals);
+  const [whole, frac = ""] = text.split(".");
+  const trimmed = frac.slice(0, 8).replace(/0+$/, "");
+  return trimmed ? `${whole}.${trimmed}` : (raw !== 0n && whole === "0" ? `<0.00000001` : whole!);
+};
+
+/**
+ * After a confirmed transaction: pin future reads to its block, log the exact balance changes of the
+ * account (block N-1 → N, read at the receipt block with retries), then notify the UI to refresh.
+ */
+export async function afterConfirmed(receipt: TransactionReceipt, label: string, log: (msg: string) => void): Promise<void> {
+  if (receipt.blockNumber > minReadBlock) minReadBlock = receipt.blockNumber;
+  const account = wallet.account;
+  if (account) {
+    try {
+      const before = receipt.blockNumber - 1n;
+      const tokens = [{ address: WETH, symbol: "WETH", decimals: 18 }, ...[...watched.values()].filter(t => t.address.toLowerCase() !== WETH.toLowerCase())];
+      const deltas = await Promise.all(tokens.map(async t => {
+        const read = (blockNumber: bigint) => publicClient.readContract({ address: t.address, abi: erc20Abi, functionName: "balanceOf", args: [account], blockNumber });
+        // A token created by this very transaction has no code at N-1: its prior balance is zero.
+        const a = await readAt(read, before).catch(error => {
+          if (/returned no data|0x"\)/.test(String((error as Error).message))) return 0n;
+          throw error;
+        });
+        const b = await readAt(read, receipt.blockNumber);
+        return { t, delta: b - a };
+      }));
+      const ethDelta = await Promise.all([before, receipt.blockNumber].map(blockNumber =>
+        readAt(n => publicClient.getBalance({ address: account, blockNumber: n }), blockNumber)));
+      for (const { t, delta } of deltas) {
+        if (delta > 0n) log(`+${formatDelta(delta, t.decimals)} ${t.symbol} received`);
+        else if (delta < 0n) log(`−${formatDelta(delta, t.decimals)} ${t.symbol} spent`);
+      }
+      const eth = ethDelta[1]! - ethDelta[0]!;
+      if (eth !== 0n) log(`${eth > 0n ? "+" : "−"}${formatDelta(eth, 18)} ETH (incl. gas)`);
+    } catch (error) {
+      log(`Balance check skipped: ${String((error as Error).message ?? error).split("\n")[0]}`);
+    }
+  }
+  txListeners.forEach(fn => fn({ receipt, label }));
+}
+
 export type Tx = { to: Address; data: Hex; value?: bigint };
 
 /** Simulates against the latest state, asks the wallet to sign, then waits for a successful receipt. */
@@ -169,15 +255,20 @@ export async function sendTx(tx: Tx, label: string, log: (msg: string) => void):
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") throw new Error(`${label} reverted (${hash})`);
   log(`${label}: confirmed in block ${receipt.blockNumber}`);
+  await afterConfirmed(receipt, label, log);
   return receipt;
 }
 
 export async function allowance(token: Address, owner: Address, spender: Address): Promise<bigint> {
-  return publicClient.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [owner, spender] });
+  return readAt(blockNumber => publicClient.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [owner, spender], blockNumber }));
 }
 
 export async function balanceOf(token: Address, owner: Address): Promise<bigint> {
-  return publicClient.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
+  return readAt(blockNumber => publicClient.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber }));
+}
+
+export async function nativeBalance(owner: Address): Promise<bigint> {
+  return readAt(blockNumber => publicClient.getBalance({ address: owner, blockNumber }));
 }
 
 /** Approves exactly `amount` (resetting a stale non-zero allowance to 0 first). */

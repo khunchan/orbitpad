@@ -1,11 +1,15 @@
 import "./style.css";
-import { isAddress, parseEther, parseUnits, getAddress, type Address } from "viem";
+import { formatUnits, isAddress, parseEther, parseUnits, getAddress, type Address } from "viem";
 import {
   addressUrl,
   connect,
   giwaSepolia,
   hasWallet,
+  nativeBalance,
+  onTxConfirmed,
   onWalletChange,
+  requireWallet,
+  watchToken,
   publicClient,
   restore,
   short,
@@ -46,6 +50,7 @@ import {
   cachedCurve,
   executePoolSwap,
   preparePoolSwap,
+  quoteToGraduate,
   tokenBalance,
   wrapEth,
   type CurveView,
@@ -95,24 +100,84 @@ function errorMessage(error: unknown): string {
   return (e?.shortMessage ?? e?.message ?? String(error)).split("\n")[0]!;
 }
 
-function logger(el: HTMLElement) {
-  el.innerHTML = "";
-  el.classList.add("show");
-  return {
-    log: (msg: string) => {
-      const line = document.createElement("div");
-      line.textContent = `› ${msg}`;
-      el.appendChild(line);
-      el.scrollTop = el.scrollHeight;
-    },
-    error: (error: unknown) => {
-      const line = document.createElement("div");
-      line.className = "err";
-      line.textContent = `✕ ${errorMessage(error)}`;
-      el.appendChild(line);
-      el.scrollTop = el.scrollHeight;
-    },
+/** Log panel bound by id, so lines keep landing in it after the page re-renders mid-flow. */
+function logger(initial: HTMLElement) {
+  const id = initial.id;
+  initial.innerHTML = "";
+  initial.classList.add("show");
+  const target = () => (id && document.getElementById(id)) || initial;
+  const write = (text: string, className?: string) => {
+    const el = target();
+    el.classList.add("show");
+    const line = document.createElement("div");
+    if (className) line.className = className;
+    line.textContent = text;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
   };
+  return {
+    log: (msg: string) => write(`› ${msg}`),
+    error: (error: unknown) => write(`✕ ${errorMessage(error)}`, "err"),
+  };
+}
+
+// ---------- Refresh after confirmed transactions ----------
+
+let busy = 0;
+let refreshPending = false;
+/** Runs a user flow (approve → trade, etc.); page refreshes triggered by its transactions wait until it ends. */
+async function flow<T>(fn: () => Promise<T>): Promise<T> {
+  busy++;
+  try {
+    return await fn();
+  } finally {
+    busy--;
+    if (busy === 0 && refreshPending) {
+      refreshPending = false;
+      void refresh();
+    }
+  }
+}
+onTxConfirmed(() => {
+  if (busy > 0) refreshPending = true;
+  else void refresh();
+});
+/** Re-renders the current page (all reads wait for the last receipt block) and keeps log panels. */
+async function refresh() {
+  const logs = new Map<string, string>();
+  document.querySelectorAll<HTMLElement>(".log.show[id]").forEach(el => logs.set(el.id, el.innerHTML));
+  await route({ keepScroll: true });
+  logs.forEach((html, id) => {
+    const el = document.getElementById(id);
+    if (el && !el.classList.contains("show")) {
+      el.innerHTML = html;
+      el.classList.add("show");
+      el.scrollTop = el.scrollHeight;
+    }
+  });
+}
+
+// ---------- Quick amounts ----------
+
+const quickRow = (id: string) =>
+  `<div class="quick" id="${id}" role="group" aria-label="Quick amount">${["10", "25", "50", "Max"].map(p => `<button type="button" data-pct="${p}">${p === "Max" ? "Max" : `${p}%`}</button>`).join("")}</div>`;
+
+/** 10/25/50/Max of an exact raw maximum; values are written with formatUnits (no float rounding). */
+function bindQuick(row: HTMLElement, input: HTMLInputElement, getMax: () => Promise<bigint>, decimals: () => number, after: () => void, onError: (error: unknown) => void) {
+  row.querySelectorAll<HTMLButtonElement>("[data-pct]").forEach(btn => btn.addEventListener("click", async () => {
+    row.querySelectorAll("button").forEach(b => (b.disabled = true));
+    try {
+      const max = await getMax();
+      const pct = btn.dataset.pct!;
+      const raw = pct === "Max" ? max : (max * BigInt(pct)) / 100n;
+      input.value = raw > 0n ? formatUnits(raw, decimals()) : "0";
+      after();
+    } catch (error) {
+      onError(error);
+    } finally {
+      row.querySelectorAll("button").forEach(b => (b.disabled = false));
+    }
+  }));
 }
 
 // ---------- Shell ----------
@@ -170,7 +235,7 @@ function renderWalletButton() {
 // ---------- Routing ----------
 
 let routeToken = 0;
-function route() {
+async function route(options: { keepScroll?: boolean } = {}) {
   routeToken++;
   const hash = location.hash.replace(/^#/, "") || "/";
   const view = document.getElementById("view")!;
@@ -178,10 +243,13 @@ function route() {
     a.classList.toggle("active", (a.dataset.route === "launch" && hash === "/launch") || (a.dataset.route === "home" && hash === "/"));
   });
   const tokenMatch = hash.match(/^\/t\/(0x[0-9a-fA-F]{40})$/);
-  if (hash === "/launch") renderLaunch(view);
-  else if (tokenMatch && isAddress(tokenMatch[1]!)) renderToken(view, getAddress(tokenMatch[1]!), routeToken);
-  else renderHome(view, routeToken);
-  window.scrollTo(0, 0);
+  const scroll = window.scrollY;
+  const rendering = hash === "/launch" ? renderLaunch(view)
+    : tokenMatch && isAddress(tokenMatch[1]!) ? renderToken(view, getAddress(tokenMatch[1]!), routeToken)
+    : renderHome(view, routeToken);
+  if (!options.keepScroll) window.scrollTo(0, 0);
+  await rendering;
+  if (options.keepScroll) window.scrollTo(0, scroll);
 }
 
 // ---------- Home ----------
@@ -297,7 +365,7 @@ async function renderHome(view: HTMLElement, token: number) {
 
 // ---------- Launch ----------
 
-function renderLaunch(view: HTMLElement) {
+async function renderLaunch(view: HTMLElement) {
   const configId = platformConfigId();
   view.innerHTML = `
     <div class="section-head" style="margin-top:0"><h2>Launch a token</h2></div>
@@ -352,7 +420,7 @@ function renderLaunch(view: HTMLElement) {
   const showBalances = async () => {
     const el = view.querySelector("#bal");
     if (!el || !wallet.account) return;
-    const [eth, weth] = await Promise.all([publicClient.getBalance({ address: wallet.account }), tokenBalance(WETH, wallet.account)]);
+    const [eth, weth] = await Promise.all([nativeBalance(wallet.account), tokenBalance(WETH, wallet.account)]);
     el.textContent = `Balance: ${fmt(eth, 18, 5)} ETH · ${fmt(weth, 18, 5)} WETH`;
   };
   showBalances().catch(() => {});
@@ -362,8 +430,7 @@ function renderLaunch(view: HTMLElement) {
     const out = logger(view.querySelector("#wrap-log")!);
     btn.disabled = true;
     try {
-      await wrapEth(parseEther((view.querySelector<HTMLInputElement>("#wrap-amt")!.value || "0").trim()), out.log);
-      await showBalances();
+      await flow(() => wrapEth(parseEther((view.querySelector<HTMLInputElement>("#wrap-amt")!.value || "0").trim()), out.log));
     } catch (error) { out.error(error); } finally { btn.disabled = false; }
   });
 
@@ -406,7 +473,7 @@ function renderLaunch(view: HTMLElement) {
     const out = logger(view.querySelector("#config-log")!);
     btn.disabled = true;
     try {
-      const id = await createPlatformConfig(out.log);
+      const id = await flow(() => createPlatformConfig(out.log));
       view.querySelector("#cfg-box")!.innerHTML = configChip(id);
       view.querySelector("#cfg-dd")!.innerHTML = configChip(id);
       out.log(`Saved in this browser. Send this number to make it the site default.`);
@@ -429,7 +496,7 @@ function renderLaunch(view: HTMLElement) {
     btn.disabled = true;
     try {
       const firstBuyRaw = firstRaw ? parseUnits(firstRaw, 18) : 0n;
-      const created = await createLaunch({ name, symbol, description, firstBuyRaw, slippageBps: Math.round(slip * 100) }, out.log);
+      const created = await flow(() => createLaunch({ name, symbol, description, firstBuyRaw, slippageBps: Math.round(slip * 100) }, out.log));
       out.log(`Token ${created.token} on curve ${created.curve}. Opening…`);
       setTimeout(() => (location.hash = `#/t/${created.curve}`), 900);
     } catch (error) {
@@ -540,7 +607,8 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
       </div>
     </div>`;
 
-  renderFees(view.querySelector<HTMLElement>("#fees")!, data, token).catch(() => {});
+  watchToken(state.baseToken, data.symbol, data.baseDecimals);
+  await renderFees(view.querySelector<HTMLElement>("#fees")!, data, token).catch(() => {});
 
   view.querySelector("#retry")?.addEventListener("click", () => route());
 
@@ -566,9 +634,8 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
       const out = logger(action.querySelector("#mig-log")!);
       btn.disabled = true;
       try {
-        const pool = await migrate(curve, out.log);
+        const pool = await flow(() => migrate(curve, out.log));
         out.log(`Graduated. Pool ${pool}`);
-        setTimeout(route, 1200);
       } catch (error) { out.error(error); btn.disabled = false; }
     });
     return;
@@ -581,7 +648,7 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
   let side: "buy" | "sell" = "buy";
   action.innerHTML = `
     <div class="tabs"><button class="on" data-side="buy">Buy</button><button data-side="sell">Sell</button></div>
-    <div class="field"><label id="amt-label" for="amt">You pay (WETH)</label><input id="amt" inputmode="decimal" placeholder="0.001" /></div>
+    <div class="field"><label id="amt-label" for="amt">You pay (WETH)</label><input id="amt" inputmode="decimal" placeholder="0.001" />${quickRow("quick")}</div>
     <div class="field"><label for="tslip">Slippage (%)</label><input id="tslip" inputmode="decimal" value="1" /></div>
     <div class="notice" id="quote">Enter an amount for a live quote.</div>
     <div class="muted small" id="tbal" style="margin:10px 0"></div>
@@ -629,6 +696,13 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
   const debounced = () => { clearTimeout(timer); timer = window.setTimeout(refreshQuote, 350); };
   amt.addEventListener("input", debounced);
   slipInput.addEventListener("input", debounced);
+  bindQuick(action.querySelector<HTMLElement>("#quick")!, amt, async () => {
+    const account = wallet.account ?? (await requireWallet()).account;
+    if (side === "sell") return tokenBalance(state.baseToken, account);
+    // Buy is capped at what the final fill needs; any unused input stays in the wallet.
+    const [weth, toGraduate] = await Promise.all([tokenBalance(WETH, account), quoteToGraduate(curve, data.segments)]);
+    return weth < toGraduate ? weth : toGraduate;
+  }, inDecimals, refreshQuote, error => { quoteEl.className = "notice warn"; quoteEl.textContent = errorMessage(error); });
 
   action.querySelectorAll<HTMLButtonElement>(".tabs button").forEach(b => b.addEventListener("click", () => {
     side = b.dataset.side as "buy" | "sell";
@@ -647,9 +721,8 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
     try {
       const amountIn = parseUnits(amt.value.trim() || "0", inDecimals());
       if (amountIn <= 0n) throw new Error("Enter an amount");
-      const swap = await executeTrade(curve, side, amountIn, slip, out.log);
-      out.log(`Done: received ${fmt(swap.amountOut, side === "buy" ? data.baseDecimals : 18, 6)} ${side === "buy" ? data.symbol : "WETH"}.`);
-      setTimeout(route, 1500);
+      const swap = await flow(() => executeTrade(curve, side, amountIn, slip, out.log));
+      out.log(`Done: swap paid out ${fmt(swap.amountOut, side === "buy" ? data.baseDecimals : 18, 6)} ${side === "buy" ? data.symbol : "WETH"}.`);
     } catch (error) {
       out.error(error);
     } finally {
@@ -666,7 +739,7 @@ function renderPoolTrade(action: HTMLElement, data: CurveView) {
     <p class="muted small" style="margin-top:0">Trading moved from the curve to the graduated concentrated pool
       <a class="mono" href="${addressUrl(pool)}" target="_blank" rel="noopener">${short(pool)}</a>.</p>
     <div class="tabs"><button class="on" data-side="buy">Buy</button><button data-side="sell">Sell</button></div>
-    <div class="field"><label id="pamt-label" for="pamt">You pay (WETH)</label><input id="pamt" inputmode="decimal" placeholder="0.0001" /></div>
+    <div class="field"><label id="pamt-label" for="pamt">You pay (WETH)</label><input id="pamt" inputmode="decimal" placeholder="0.0001" />${quickRow("pquick")}</div>
     <div class="field"><label for="pslip">Slippage (%)</label><input id="pslip" inputmode="decimal" value="1" /></div>
     <div class="notice" id="pquote">Enter an amount for a live pool quote.</div>
     <div class="muted small" id="pbal" style="margin:10px 0"></div>
@@ -714,6 +787,10 @@ function renderPoolTrade(action: HTMLElement, data: CurveView) {
   const debounced = () => { clearTimeout(timer); timer = window.setTimeout(refresh, 400); };
   amt.addEventListener("input", debounced);
   slipInput.addEventListener("input", debounced);
+  bindQuick(action.querySelector<HTMLElement>("#pquick")!, amt, async () => {
+    const account = wallet.account ?? (await requireWallet()).account;
+    return tokenBalance(tokenIn(), account);
+  }, inDecimals, refresh, error => { quoteEl.className = "notice warn"; quoteEl.textContent = errorMessage(error); });
   action.querySelectorAll<HTMLButtonElement>(".tabs button").forEach(b => b.addEventListener("click", () => {
     side = b.dataset.side as "buy" | "sell";
     action.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x === b));
@@ -730,11 +807,8 @@ function renderPoolTrade(action: HTMLElement, data: CurveView) {
     try {
       const amountIn = parseUnits(amt.value.trim() || "0", inDecimals());
       if (amountIn <= 0n) throw new Error("Enter an amount");
-      const result = await executePoolSwap(pool, tokenIn(), amountIn, slip, out.log);
-      const outDec = side === "buy" ? data.baseDecimals : 18;
-      out.log(`Done${result.amountReceived !== null ? `: received ${fmt(result.amountReceived, outDec, 6)} ${side === "buy" ? data.symbol : "WETH"}` : ""}.`);
-      await showBal();
-      refresh();
+      await flow(() => executePoolSwap(pool, tokenIn(), amountIn, slip, out.log));
+      out.log("Done.");
     } catch (error) {
       out.error(error);
     } finally {
@@ -769,8 +843,7 @@ async function renderFees(box: HTMLElement, data: CurveView, token: number) {
     const out = logger(box.querySelector("#claim-log")!);
     btn.disabled = true;
     try {
-      await claimFees(fees.vault, tokenAddress, out.log);
-      setTimeout(() => renderFees(box, data, token), 800);
+      await flow(() => claimFees(fees.vault, tokenAddress, out.log));
     } catch (error) { out.error(error); btn.disabled = false; }
   });
   bind("#claim-q", state.quoteToken);
@@ -790,6 +863,6 @@ onWalletChange(() => {
 });
 watchProvider();
 restore().catch(() => {});
-window.addEventListener("hashchange", route);
+window.addEventListener("hashchange", () => void route());
 route();
 

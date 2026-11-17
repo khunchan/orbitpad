@@ -10,6 +10,7 @@ import {
   createConfigAndPoolWithFirstBuy,
   deltaQuote,
   excludeAmmoraFee,
+  includeAmmoraFee,
   feeVaultAbi,
   getAmmoraV4ConfigAtBlock,
   parseAmmoraV4ConfigCreatedReceipt,
@@ -31,7 +32,10 @@ import {
   ensureExactAllowance,
   giwaSepolia,
   launch,
+  afterConfirmed,
+  balanceOf,
   deployment,
+  freshBlockNumber,
   publicClient,
   requireWallet,
   revokeLeftover,
@@ -363,7 +367,7 @@ export async function readCurve(curve: Address): Promise<CurveView> {
 
 async function readCurveLive(curve: Address): Promise<CurveView> {
   const client = curveClient(curve);
-  const blockNumber = await publicClient.getBlockNumber();
+  const blockNumber = await freshBlockNumber();
   const state = await client.getStateAtBlock(blockNumber);
   const [name, symbol, baseDecimals, snapshot] = await Promise.all([
     publicClient.readContract({ address: state.baseToken, abi: erc20Abi, functionName: "name", blockNumber }),
@@ -405,7 +409,7 @@ export function progressOf(state: Pick<AmmoraV4LaunchCurveState, "status" | "quo
 
 /** Lightweight list status: state + token symbol. */
 export async function readRowState(curve: Address): Promise<{ state: AmmoraV4LaunchCurveState; name: string; symbol: string }> {
-  const state = await curveClient(curve).getState();
+  const state = await curveClient(curve).getStateAtBlock(await freshBlockNumber());
   const [name, symbol] = await Promise.all([
     publicClient.readContract({ address: state.baseToken, abi: erc20Abi, functionName: "name" }),
     publicClient.readContract({ address: state.baseToken, abi: erc20Abi, functionName: "symbol" }),
@@ -427,7 +431,7 @@ export type TradePreview = {
 export async function previewTrade(curve: Address, side: "buy" | "sell", amountIn: bigint, slippageBps: number): Promise<TradePreview> {
   const client = curveClient(curve);
   const baseForQuote = side === "sell";
-  const blockNumber = await publicClient.getBlockNumber();
+  const blockNumber = await freshBlockNumber();
   const quote = await client.quoteExactInputAtBlock(amountIn, baseForQuote, blockNumber);
   const fill = classifyAmmoraV4ExactInputFill(quote, baseForQuote);
   return {
@@ -446,7 +450,7 @@ export async function executeTrade(curve: Address, side: "buy" | "sell", amountI
   const baseForQuote = side === "sell";
 
   const freshPlan = async () => {
-    const blockNumber = await publicClient.getBlockNumber();
+    const blockNumber = await freshBlockNumber();
     const block = await publicClient.getBlock({ blockNumber });
     const quote = await client.quoteExactInputAtBlock(amountIn, baseForQuote, blockNumber);
     const fill = classifyAmmoraV4ExactInputFill(quote, baseForQuote);
@@ -485,7 +489,7 @@ export async function executeTrade(curve: Address, side: "buy" | "sell", amountI
 export async function migrate(curve: Address, log: Log): Promise<Address> {
   const { account } = await requireWallet();
   const client = curveClient(curve);
-  const blockNumber = await publicClient.getBlockNumber();
+  const blockNumber = await freshBlockNumber();
   const state = await client.getStateAtBlock(blockNumber);
   if (state.status === 3) return state.canonicalPool;
   if (state.status !== 2) throw new Error("Curve is not ReadyToMigrate");
@@ -523,6 +527,7 @@ export async function preparePoolSwap(pool: Address, tokenIn: Address, amountIn:
     recipient: payer,
     slippageBps,
     executionMode: "direct-wallet",
+    quoteBlockNumber: await freshBlockNumber(),
   });
 }
 
@@ -547,6 +552,7 @@ export async function executePoolSwap(pool: Address, tokenIn: Address, amountIn:
     },
   });
   for (const spender of spenders) await revokeLeftover(tokenIn, spender, log);
+  await afterConfirmed(result.receipt, "Pool swap", log);
   return result;
 }
 
@@ -584,8 +590,9 @@ export type Claimable = { vault: Address; quote: bigint; base: bigint };
 export async function claimableFees(state: AmmoraV4LaunchCurveState, beneficiary: Address): Promise<Claimable> {
   const vault = await factoryFeeVault();
   if (vault.toLowerCase() !== state.feeVault.toLowerCase()) throw new Error("Curve fee vault does not match the factory fee vault");
+  const blockNumber = await freshBlockNumber();
   const read = (token: Address) =>
-    publicClient.readContract({ address: vault, abi: feeVaultAbi, functionName: "claimable", args: [token, beneficiary] }) as Promise<bigint>;
+    publicClient.readContract({ address: vault, abi: feeVaultAbi, functionName: "claimable", args: [token, beneficiary], blockNumber }) as Promise<bigint>;
   const [quote, base] = await Promise.all([read(state.quoteToken), read(state.baseToken)]);
   return { vault, quote, base };
 }
@@ -646,6 +653,18 @@ export function raisedAt(segments: readonly AmmoraV4Segment[], sqrtPrice: bigint
   return raised;
 }
 
-export const tokenBalance = async (token: Address, owner: Address) =>
-  publicClient.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [owner] });
+export const tokenBalance = balanceOf;
+
+/** WETH (fee-included) needed to take the curve from its current price to graduation, rounded up. */
+export async function quoteToGraduate(curve: Address, segments: readonly AmmoraV4Segment[]): Promise<bigint> {
+  const state = await curveClient(curve).getStateAtBlock(await freshBlockNumber());
+  let needed = 0n;
+  for (const seg of segments) {
+    const from = state.sqrtPrice > seg.lowerSqrtPrice ? state.sqrtPrice : seg.lowerSqrtPrice;
+    if (seg.upperSqrtPrice > from) needed += deltaQuote(from, seg.upperSqrtPrice, seg.liquidity, true);
+  }
+  if (needed === 0n) return 0n;
+  const feeBps = BigInt(state.currentFeeBps + state.currentDynamicFeeBps);
+  return includeAmmoraFee(needed, feeBps).included + 1n;
+}
 
