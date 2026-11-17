@@ -1,5 +1,7 @@
 import {
   AmmoraDataApiClient,
+  AmmoraSwapClient,
+  giwaSepoliaAutoRoutePoolProfiles,
   AmmoraV4LaunchCurveClient,
   ammoraLaunchFactoryV4Abi,
   buildClaimFeeVaultFor,
@@ -29,6 +31,7 @@ import {
   ensureExactAllowance,
   giwaSepolia,
   launch,
+  deployment,
   publicClient,
   requireWallet,
   revokeLeftover,
@@ -328,7 +331,37 @@ export type CurveView = {
   config: AmmoraV4Config;
 };
 
+// Last successfully read data, kept in memory and localStorage so a rate-limited RPC isn't a dead end.
+const curveCache = new Map<string, { view: CurveView; at: number }>();
+const CACHE_PREFIX = "orbitpad-curve:";
+const toJson = (value: unknown) => JSON.stringify(value, (_, v) => (typeof v === "bigint" ? { __b: v.toString() } : v));
+const fromJson = <T>(text: string): T =>
+  JSON.parse(text, (_, v) => (v && typeof v === "object" && typeof v.__b === "string" ? BigInt(v.__b) : v));
+
+export function cachedCurve(curve: Address): { view: CurveView; at: number } | null {
+  const key = curve.toLowerCase();
+  const hit = curveCache.get(key);
+  if (hit) return hit;
+  try {
+    const stored = localStorage.getItem(CACHE_PREFIX + key);
+    if (stored) {
+      const parsed = fromJson<{ view: CurveView; at: number }>(stored);
+      curveCache.set(key, parsed);
+      return parsed;
+    }
+  } catch { /* storage unavailable or corrupt */ }
+  return null;
+}
+
 export async function readCurve(curve: Address): Promise<CurveView> {
+  const view = await readCurveLive(curve);
+  const entry = { view, at: Date.now() };
+  curveCache.set(curve.toLowerCase(), entry);
+  try { localStorage.setItem(CACHE_PREFIX + curve.toLowerCase(), toJson(entry)); } catch { /* ignore */ }
+  return view;
+}
+
+async function readCurveLive(curve: Address): Promise<CurveView> {
   const client = curveClient(curve);
   const blockNumber = await publicClient.getBlockNumber();
   const state = await client.getStateAtBlock(blockNumber);
@@ -346,6 +379,14 @@ export const isOrbitPadLaunch = (state: Pick<AmmoraV4LaunchCurveState, "configId
   state.configId === ORBITPAD_CONFIG_ID || state.partnerRecipient.toLowerCase() === PARTNER.toLowerCase();
 
 /** Exact percentage string that stays readable for tiny progress against huge thresholds. */
+/** One-line progress summary; after the final fill the curve reserve is no longer the amount raised. */
+export function progressSummary(state: Pick<AmmoraV4LaunchCurveState, "status" | "quoteReserve" | "migrationQuoteThreshold">): string {
+  const threshold = `${fmt(state.migrationQuoteThreshold, 18, 6)} WETH`;
+  if (state.status === 3) return `Graduated · raised ${threshold}`;
+  if (state.status === 2) return `Ready to migrate · raised ${threshold}`;
+  return `${progressText(state)} to graduation · ${fmt(state.quoteReserve, 18, 6)} / ${threshold}`;
+}
+
 export function progressText(state: Pick<AmmoraV4LaunchCurveState, "status" | "quoteReserve" | "migrationQuoteThreshold">): string {
   if (state.status >= 2) return "100%";
   if (state.migrationQuoteThreshold === 0n || state.quoteReserve === 0n) return "0%";
@@ -460,6 +501,55 @@ export async function migrate(curve: Address, log: Log): Promise<Address> {
   return after.canonicalPool;
 }
 
+// ---------- Graduated pool trading ----------
+
+let swapClient: Promise<AmmoraSwapClient> | null = null;
+const swaps = () => (swapClient ??= AmmoraSwapClient.create(publicClient, {
+  deploymentCatalog: { [giwaSepolia.id]: deployment },
+  factoryProfiles: giwaSepoliaAutoRoutePoolProfiles,
+  quoteTtlMs: 30_000,
+}).catch(error => { swapClient = null; throw error; }));
+
+/** Fresh quote + plan for an exact-input swap in the graduated concentrated pool. */
+export async function preparePoolSwap(pool: Address, tokenIn: Address, amountIn: bigint, slippageBps: number, payer: Address) {
+  const client = await swaps();
+  return client.prepareExactIn({
+    model: "concentrated",
+    pool,
+    tokenIn,
+    inputAsset: "erc20",
+    amountIn,
+    payer,
+    recipient: payer,
+    slippageBps,
+    executionMode: "direct-wallet",
+  });
+}
+
+export async function executePoolSwap(pool: Address, tokenIn: Address, amountIn: bigint, slippageBps: number, log: Log) {
+  const { client, account } = await requireWallet();
+  log("Fresh pool quote…");
+  const prepared = await preparePoolSwap(pool, tokenIn, amountIn, slippageBps, account);
+  if (prepared.quote.remainderAmountIn > 0n) throw new Error("Pool cannot fill this amount in full; try a smaller amount");
+  const spenders = prepared.approvalRequirements.map(r => r.spender);
+  const result = await prepared.execute(client, {
+    autoRefresh: true,
+    sendApprovals: true,
+    exactApproval: true,
+    simulate: true,
+    onStatus: status => {
+      if (status.type === "quote-refreshed") log(`Quote refreshed: min out ${status.quote.minimumAmountOut}`);
+      else if (status.type === "approval-requested") log("Approve exact amount: confirm in your wallet…");
+      else if (status.type === "approval-confirmed") log(`Approval confirmed in block ${status.blockNumber}`);
+      else if (status.type === "swap-requested") log("Swap: confirm in your wallet…");
+      else if (status.type === "swap-submitted") log(`Swap submitted ${status.hash.slice(0, 10)}…`);
+      else if (status.type === "swap-confirmed") log(`Swap confirmed in block ${status.blockNumber}`);
+    },
+  });
+  for (const spender of spenders) await revokeLeftover(tokenIn, spender, log);
+  return result;
+}
+
 // ---------- Fee split / claims ----------
 
 const pct = (bps: number) => `${(bps / 100).toFixed(bps % 100 ? 2 : 0)}%`;
@@ -539,7 +629,8 @@ export function curvePoints(segments: readonly AmmoraV4Segment[], baseDecimals: 
   for (const seg of segments) {
     for (let i = 0; i <= samples; i++) {
       const s = seg.lowerSqrtPrice + (seg.upperSqrtPrice - seg.lowerSqrtPrice) * BigInt(i) / BigInt(samples);
-      points.push({ x: raised + Number(deltaQuote(seg.lowerSqrtPrice, s, seg.liquidity, false)) / 1e18, y: priceFromSqrt(s, baseDecimals) });
+      const quote = s > seg.lowerSqrtPrice ? deltaQuote(seg.lowerSqrtPrice, s, seg.liquidity, false) : 0n;
+      points.push({ x: raised + Number(quote) / 1e18, y: priceFromSqrt(s, baseDecimals) });
     }
     raised += Number(deltaQuote(seg.lowerSqrtPrice, seg.upperSqrtPrice, seg.liquidity, false)) / 1e18;
   }

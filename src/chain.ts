@@ -5,6 +5,7 @@ import {
   encodeFunctionData,
   defineChain,
   erc20Abi,
+  fallback,
   http,
   type Address,
   type EIP1193Provider,
@@ -17,6 +18,11 @@ import { giwaSepoliaAutoRouteDeployment } from "@ammora-protocol/sdk";
 export const deployment = giwaSepoliaAutoRouteDeployment;
 export const launch = deployment.contracts.launch;
 export const RPC_URL = "https://sepolia-rpc.giwa.io";
+/** Backups: GIWA's Flashblocks endpoint and Pocket Network's public GIWA Sepolia endpoint. */
+export const FALLBACK_RPC_URLS = [
+  "https://sepolia-rpc-flashblocks.giwa.io",
+  "https://giwa-sepolia-testnet.api.pocket.network",
+] as const;
 export const EXPLORER = "https://sepolia-explorer.giwa.io";
 export const WETH: Address = "0x4200000000000000000000000000000000000006";
 export const DATA_API = "https://ammora-giwa-sepolia-data.fly.dev";
@@ -25,7 +31,7 @@ export const giwaSepolia = defineChain({
   id: 91342,
   name: "GIWA Sepolia",
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-  rpcUrls: { default: { http: [RPC_URL] } },
+  rpcUrls: { default: { http: [RPC_URL, ...FALLBACK_RPC_URLS] } },
   blockExplorers: { default: { name: "GIWA Explorer", url: EXPLORER } },
   testnet: true,
 });
@@ -34,7 +40,34 @@ if (deployment.chain.id !== giwaSepolia.id || launch.protocolVersion !== 4) {
   throw new Error("OrbitPad requires the GIWA Sepolia V4 auto-route deployment");
 }
 
-export const publicClient = createPublicClient({ chain: giwaSepolia, transport: http(RPC_URL, { batch: true }) });
+/** At most MAX_INFLIGHT HTTP requests at once across all RPCs, so list pages don't trip public rate limits. */
+const MAX_INFLIGHT = 4;
+let inflight = 0;
+const waiting: Array<() => void> = [];
+const limitedFetch: typeof fetch = async (input, init) => {
+  if (inflight >= MAX_INFLIGHT) await new Promise<void>(resolve => waiting.push(resolve));
+  inflight++;
+  try {
+    return await fetch(input, init);
+  } finally {
+    inflight--;
+    waiting.shift()?.();
+  }
+};
+
+// viem retries with exponential backoff: delay = 2^attempt × retryDelay (here 400 ms, 800 ms, 1.6 s).
+const rpc = (url: string) => http(url, {
+  batch: { batchSize: 10, wait: 16 },
+  retryCount: 3,
+  retryDelay: 400,
+  timeout: 15_000,
+  fetchFn: limitedFetch,
+});
+
+export const publicClient = createPublicClient({
+  chain: giwaSepolia,
+  transport: fallback([rpc(RPC_URL), ...FALLBACK_RPC_URLS.map(rpc)], { retryCount: 1, retryDelay: 500 }),
+});
 
 export const core = {
   configRegistry: launch.configRegistry,

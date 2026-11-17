@@ -41,7 +41,11 @@ import {
   statusLabel,
   progressOf,
   progressText,
+  progressSummary,
   isOrbitPadLaunch,
+  cachedCurve,
+  executePoolSwap,
+  preparePoolSwap,
   tokenBalance,
   wrapEth,
   type CurveView,
@@ -76,6 +80,15 @@ document.addEventListener("click", async e => {
   }
   setTimeout(() => (btn.textContent = "Copy"), 1500);
 });
+
+/** Transport-level failures (rate limits, timeouts, network) as opposed to "this curve isn't readable". */
+function isRpcError(error: unknown): boolean {
+  for (let e = error as { name?: string; message?: string; cause?: unknown } | undefined; e; e = e.cause as typeof e) {
+    if (/HttpRequestError|TimeoutError|RpcRequestError|LimitExceeded|ResourceUnavailable|InternalRpc/.test(e.name ?? "")
+      || /RPC Request failed|rate limit|Failed to fetch|timed out|429/i.test(e.message ?? "")) return true;
+  }
+  return false;
+}
 
 function errorMessage(error: unknown): string {
   const e = error as { shortMessage?: string; message?: string };
@@ -230,33 +243,52 @@ async function renderHome(view: HTMLElement, token: number) {
     pending = rows.length;
     updateEmpty();
     // Fill in on-chain status/progress; unreadable curves (other generations/launchpads) are dropped.
+    const fill = async (r: (typeof rows)[number], card: HTMLElement) => {
+      const { state, name, symbol } = await readRowState(r.curve);
+      if (token !== routeToken) return;
+      const ours = isOrbitPadLaunch(state);
+      card.classList.add("ready-row");
+      card.classList.toggle("ours", ours);
+      card.querySelector("[data-f=name]")!.textContent = name;
+      card.querySelector("[data-f=sym]")!.textContent = `$${symbol}${ours ? "" : ` · Config #${state.configId}`}`;
+      card.querySelector("[data-f=status]")!.innerHTML = statusPill(statusLabel(state.status));
+      card.querySelector("[data-f=bar]")!.innerHTML = progressBar(progressOf(state));
+      card.querySelector("[data-f=pct]")!.textContent = progressSummary(state);
+      card.hidden = false;
+    };
+    const showRetry = (r: (typeof rows)[number], card: HTMLElement) => {
+      card.classList.add("ready-row");
+      card.classList.toggle("ours", r.configId === platformConfigId());
+      card.querySelector("[data-f=name]")!.textContent = short(r.token);
+      card.querySelector("[data-f=sym]")!.textContent = `Config #${r.configId}`;
+      card.querySelector("[data-f=pct]")!.innerHTML = `RPC busy — <button type="button" class="icon small" data-retry>Retry</button>`;
+      card.hidden = false;
+      card.querySelector("[data-retry]")!.addEventListener("click", async e => {
+        e.preventDefault();
+        e.stopPropagation();
+        card.querySelector("[data-f=pct]")!.textContent = "Loading…";
+        try { await fill(r, card); } catch (error) { if (isRpcError(error)) showRetry(r, card); else card.remove(); }
+      });
+    };
+    // Fill in on-chain status/progress; unreadable curves (other generations/launchpads) are dropped,
+    // while transient RPC failures keep the card with a Retry button.
     const queue = [...rows];
     const worker = async () => {
       for (let r = queue.shift(); r; r = queue.shift()) {
         if (token !== routeToken) return;
         const card = list.querySelector<HTMLElement>(`[data-curve="${r.curve}"]`);
         try {
-          const { state, name, symbol } = await readRowState(r.curve);
-          if (!card || token !== routeToken) continue;
-          const ours = isOrbitPadLaunch(state);
-          card.classList.add("ready-row");
-          if (ours) card.classList.add("ours");
-          card.querySelector("[data-f=name]")!.textContent = name;
-          card.querySelector("[data-f=sym]")!.textContent = `$${symbol}${ours ? "" : ` · Config #${state.configId}`}`;
-          card.querySelector("[data-f=status]")!.innerHTML = statusPill(statusLabel(state.status));
-          card.querySelector("[data-f=bar]")!.innerHTML = progressBar(progressOf(state));
-          card.querySelector("[data-f=pct]")!.textContent =
-            `${progressText(state)} to graduation · ${fmt(state.quoteReserve, 18, 5)} / ${fmt(state.migrationQuoteThreshold, 18, 5)} WETH`;
-          card.hidden = false;
-        } catch {
-          card?.remove();
+          if (card) await fill(r, card);
+        } catch (error) {
+          if (card && isRpcError(error)) showRetry(r, card);
+          else card?.remove();
         } finally {
           pending--;
           updateEmpty();
         }
       }
     };
-    await Promise.all([worker(), worker(), worker(), worker()]);
+    await Promise.all([worker(), worker()]);
   } catch (error) {
     if (token !== routeToken) return;
     list.innerHTML = `<div class="card"><div class="notice warn">Could not load launches: ${esc(errorMessage(error))}</div></div>`;
@@ -447,19 +479,29 @@ function chartSvg(view: CurveView): string {
 async function renderToken(view: HTMLElement, curve: Address, token: number) {
   view.innerHTML = `<div class="card"><div class="skeleton" style="width:40%"></div><div class="skeleton" style="margin-top:14px"></div><div class="skeleton" style="margin-top:14px;width:70%"></div></div>`;
   let data: CurveView;
+  let staleNote = "";
   try {
     data = await readCurve(curve);
   } catch (error) {
     if (token !== routeToken) return;
-    view.innerHTML = `<div class="card"><div class="notice warn">Could not read this curve: ${esc(errorMessage(error))}</div><p><a href="#/">← Back to launches</a></p></div>`;
-    return;
+    const cached = cachedCurve(curve);
+    if (!cached) {
+      view.innerHTML = `<div class="card"><div class="notice warn">Could not read this curve: ${esc(errorMessage(error))}</div>
+        <div class="inline" style="margin-top:14px"><button class="primary" id="retry">Retry</button><a href="#/">← Back to launches</a></div></div>`;
+      view.querySelector("#retry")!.addEventListener("click", () => route());
+      return;
+    }
+    data = cached.view;
+    staleNote = `<div class="notice warn inline" style="margin-bottom:14px;justify-content:space-between">
+      <span>Live refresh failed (${esc(errorMessage(error))}). Showing data from block ${data.state.asOfBlock}, read ${new Date(cached.at).toLocaleTimeString()}.</span>
+      <button id="retry">Retry</button></div>`;
   }
   if (token !== routeToken) return;
   const { state } = data;
   const status = statusLabel(state.status);
   const price = priceFromSqrt(state.sqrtPrice, data.baseDecimals);
 
-  view.innerHTML = `
+  view.innerHTML = `${staleNote}
     <div class="token-head">
       ${pixelAvatar(state.baseToken, 64)}
       <div style="min-width:0;flex:1">
@@ -476,7 +518,7 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
         <div class="card">
           <div class="inline" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">Graduation progress</h2><strong>${progressText(state)}</strong></div>
           ${progressBar(data.progressBps)}
-          <p class="muted small" style="margin-bottom:0">${fmt(state.quoteReserve, 18, 6)} of ${fmt(state.migrationQuoteThreshold, 18, 6)} WETH raised on the curve.</p>
+          <p class="muted small" style="margin-bottom:0">${esc(progressSummary(state))}</p>
         </div>
         <div class="card chart"><h2>Bonding curve</h2>${chartSvg(data)}
           <p class="muted small" style="margin-bottom:0">Price (WETH per token) against WETH raised. The dot is the current price.</p></div>
@@ -500,6 +542,8 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
 
   renderFees(view.querySelector<HTMLElement>("#fees")!, data, token).catch(() => {});
 
+  view.querySelector("#retry")?.addEventListener("click", () => route());
+
   findLaunch(curve).then(row => {
     if (token !== routeToken || !row) return;
     const meta = parseMetadata(row.metadataURI);
@@ -509,9 +553,7 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
 
   const action = view.querySelector<HTMLElement>("#action")!;
   if (state.status === 3) {
-    action.innerHTML = `<h2>Graduated 🎓</h2>
-      <p class="muted">This token has migrated off the bonding curve into its canonical pool.</p>
-      <dl class="kv"><dt>Pool</dt><dd><a class="mono" href="${addressUrl(state.canonicalPool)}" target="_blank" rel="noopener">${short(state.canonicalPool)}</a></dd></dl>`;
+    renderPoolTrade(action, data);
     return;
   }
   if (state.status === 2) {
@@ -612,6 +654,91 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
       out.error(error);
     } finally {
       tradeBtn.disabled = false;
+    }
+  });
+}
+
+function renderPoolTrade(action: HTMLElement, data: CurveView) {
+  const { state } = data;
+  const pool = state.canonicalPool;
+  let side: "buy" | "sell" = "buy";
+  action.innerHTML = `<h2>Graduated 🎓</h2>
+    <p class="muted small" style="margin-top:0">Trading moved from the curve to the graduated concentrated pool
+      <a class="mono" href="${addressUrl(pool)}" target="_blank" rel="noopener">${short(pool)}</a>.</p>
+    <div class="tabs"><button class="on" data-side="buy">Buy</button><button data-side="sell">Sell</button></div>
+    <div class="field"><label id="pamt-label" for="pamt">You pay (WETH)</label><input id="pamt" inputmode="decimal" placeholder="0.0001" /></div>
+    <div class="field"><label for="pslip">Slippage (%)</label><input id="pslip" inputmode="decimal" value="1" /></div>
+    <div class="notice" id="pquote">Enter an amount for a live pool quote.</div>
+    <div class="muted small" id="pbal" style="margin:10px 0"></div>
+    <button class="primary" id="ptrade" style="width:100%">Buy</button>
+    <div class="log" id="ptrade-log"></div>`;
+  const amt = action.querySelector<HTMLInputElement>("#pamt")!;
+  const slipInput = action.querySelector<HTMLInputElement>("#pslip")!;
+  const quoteEl = action.querySelector<HTMLElement>("#pquote")!;
+  const btn = action.querySelector<HTMLButtonElement>("#ptrade")!;
+  const tokenIn = () => (side === "buy" ? state.quoteToken : state.baseToken);
+  const inDecimals = () => (side === "buy" ? 18 : data.baseDecimals);
+  const slippageBps = () => Math.round(Number(slipInput.value || "1") * 100);
+
+  const showBal = async () => {
+    if (!wallet.account) return;
+    const [w, t] = await Promise.all([tokenBalance(WETH, wallet.account), tokenBalance(state.baseToken, wallet.account)]);
+    action.querySelector("#pbal")!.textContent = `You hold ${fmt(w, 18, 5)} WETH · ${fmt(t, data.baseDecimals, 2)} ${data.symbol}`;
+  };
+  showBal().catch(() => {});
+
+  let seq = 0;
+  const refresh = async () => {
+    const mine = ++seq;
+    const raw = amt.value.trim();
+    if (!raw || Number(raw) <= 0) { quoteEl.className = "notice"; quoteEl.textContent = "Enter an amount for a live pool quote."; return; }
+    try {
+      const payer = wallet.account ?? state.creator; // quoting only; execution re-plans for the connected wallet
+      const prepared = await preparePoolSwap(pool, tokenIn(), parseUnits(raw, inDecimals()), slippageBps(), payer);
+      if (mine !== seq) return;
+      const q = prepared.quote;
+      const outDec = side === "buy" ? data.baseDecimals : 18;
+      const outSym = side === "buy" ? data.symbol : "WETH";
+      quoteEl.className = q.remainderAmountIn > 0n ? "notice warn" : "notice";
+      quoteEl.innerHTML = `≈ ${fmt(q.expectedAmountOut, outDec, 6)} ${esc(outSym)} · min ${fmt(q.minimumAmountOut, outDec, 6)} after ${(slippageBps() / 100).toFixed(2)}% slippage`
+        + (q.priceImpactBps !== null ? ` · impact ${(Number(q.priceImpactBps) / 100).toFixed(2)}%` : "")
+        + (q.remainderAmountIn > 0n ? "<br>The pool cannot fill this amount in full. Try a smaller amount." : "");
+      btn.disabled = q.remainderAmountIn > 0n;
+    } catch (error) {
+      if (mine !== seq) return;
+      quoteEl.className = "notice warn";
+      quoteEl.textContent = errorMessage(error);
+    }
+  };
+  let timer: number | undefined;
+  const debounced = () => { clearTimeout(timer); timer = window.setTimeout(refresh, 400); };
+  amt.addEventListener("input", debounced);
+  slipInput.addEventListener("input", debounced);
+  action.querySelectorAll<HTMLButtonElement>(".tabs button").forEach(b => b.addEventListener("click", () => {
+    side = b.dataset.side as "buy" | "sell";
+    action.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x === b));
+    action.querySelector("#pamt-label")!.textContent = side === "buy" ? "You pay (WETH)" : `You sell (${data.symbol})`;
+    amt.placeholder = side === "buy" ? "0.0001" : "10000";
+    btn.textContent = side === "buy" ? "Buy" : "Sell";
+    refresh();
+  }));
+  btn.addEventListener("click", async () => {
+    const out = logger(action.querySelector("#ptrade-log")!);
+    const slip = slippageBps();
+    if (!(slip > 0 && slip < 5000)) return out.error("Slippage must be between 0 and 50%");
+    btn.disabled = true;
+    try {
+      const amountIn = parseUnits(amt.value.trim() || "0", inDecimals());
+      if (amountIn <= 0n) throw new Error("Enter an amount");
+      const result = await executePoolSwap(pool, tokenIn(), amountIn, slip, out.log);
+      const outDec = side === "buy" ? data.baseDecimals : 18;
+      out.log(`Done${result.amountReceived !== null ? `: received ${fmt(result.amountReceived, outDec, 6)} ${side === "buy" ? data.symbol : "WETH"}` : ""}.`);
+      await showBal();
+      refresh();
+    } catch (error) {
+      out.error(error);
+    } finally {
+      btn.disabled = false;
     }
   });
 }
