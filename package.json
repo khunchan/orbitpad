@@ -14,7 +14,8 @@
     "viem": "2.57.20"
   },
   "devDependencies": {
-    "typescript": "^7.0.2",
+    "netlify-cli": "27.20.0",
+    "typescript": "5.9.3",
     "vite": "^8.3.8"
   }
 }

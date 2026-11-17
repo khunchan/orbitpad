@@ -3,7 +3,7 @@
 A small token launchpad on **GIWA Sepolia testnet** (chainId 91342), built with the
 [Ammora SDK](https://www.npmjs.com/package/@ammora-protocol/sdk) `@ammora-protocol/sdk@0.3.9` (auto-route generation).
 
-Live: https://khunchan.github.io/orbitpad/
+Live: https://orbitpad-giwa.netlify.app/
 
 > Built with the Ammora SDK. Not an official Ammora site. Testnet only, pre-audit — do not use real funds.
 
@@ -25,7 +25,7 @@ Live: https://khunchan.github.io/orbitpad/
 npm ci --ignore-scripts
 npm run dev
 npm run build
-npm run deploy   # publish dist/ to the gh-pages branch
+npm run deploy   # production deploy to Netlify (run `npx netlify login` and `npx netlify link` once)
 ```
 
 `src/config-from-template.ts` is adapted from [AmmoraLabs/ammora-examples](https://github.com/AmmoraLabs/ammora-examples) (MIT).
