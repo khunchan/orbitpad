@@ -494,6 +494,9 @@ async function renderHome(view: HTMLElement, token: number) {
 
 // ---------- Launch ----------
 
+/** The Platform Config panel is an admin tool: only the OrbitPad platform wallet sees it. */
+const isPlatformWallet = () => wallet.account?.toLowerCase() === PARTNER.toLowerCase();
+
 async function renderLaunch(view: HTMLElement) {
   const configId = platformConfigId();
   view.innerHTML = `
@@ -520,7 +523,7 @@ async function renderLaunch(view: HTMLElement) {
             <dt>Quote asset</dt><dd>WETH</dd>
             <dt>Graduation at</dt><dd>${fmt(THRESHOLD_RAW, 18)} WETH</dd>
             <dt>Sale supply</dt><dd>100,000,000 tokens</dd>
-            <dt>Platform Config</dt><dd id="cfg-dd">${configId === null ? "not created yet" : configChip(configId)}</dd>
+            <dt>Platform Config</dt><dd id="cfg-dd">${configId === null ? "not created yet" : `#${configId}`}</dd>
             <dt>Creator</dt><dd>you (the launching wallet)</dd>
             <dt>Partner</dt><dd class="mono">${short(PARTNER)}</dd>
           </dl>
@@ -532,12 +535,12 @@ async function renderLaunch(view: HTMLElement) {
           <div class="muted small" id="bal" style="margin-top:8px"></div>
           <div class="log" id="wrap-log"></div>
         </div>
-        <div class="card">
+        ${isPlatformWallet() ? `<div class="card">
           <h3>Platform Config</h3>
           <p class="muted small" style="margin-top:0">Launches without a first buy use OrbitPad's shared Config: template #6 fees and split, 0.01 WETH threshold. The platform wallet <code>${short(PARTNER)}</code> owns it and is partner, liquidity partner and leftover receiver. Create it once while connected as that wallet.</p>
           <div id="cfg-box">${configId === null ? `<button id="mkconfig">Create platform Config</button>` : configChip(configId)}</div>
           <div class="log" id="config-log"></div>
-        </div>
+        </div>` : ""}
         <div class="card">
           <h3>Creator / Partner split (template #6)</h3>
           <div id="split"><div class="skeleton"></div></div>
@@ -604,7 +607,7 @@ async function renderLaunch(view: HTMLElement) {
     try {
       const id = await flow(() => createPlatformConfig(out.log));
       view.querySelector("#cfg-box")!.innerHTML = configChip(id);
-      view.querySelector("#cfg-dd")!.innerHTML = configChip(id);
+      view.querySelector("#cfg-dd")!.textContent = `#${id}`;
       out.log(`Saved in this browser. Send this number to make it the site default.`);
     } catch (error) { out.error(error); btn.disabled = false; }
   });
@@ -1067,7 +1070,7 @@ onWalletChange(() => {
   renderWalletButton();
   if (wallet.account !== lastAccount) {
     lastAccount = wallet.account;
-    if (location.hash.startsWith("#/t/")) route();
+    if (location.hash.startsWith("#/t/") || location.hash === "#/launch") void route({ keepScroll: true });
   }
 });
 watchProvider();
