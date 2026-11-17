@@ -2,9 +2,11 @@ import {
   AmmoraDataApiClient,
   AmmoraV4LaunchCurveClient,
   ammoraLaunchFactoryV4Abi,
+  buildClaimFeeVaultFor,
   buildCreateAmmoraV4Launch,
   classifyAmmoraV4ExactInputFill,
   createConfigAndPoolWithFirstBuy,
+  feeVaultAbi,
   getAmmoraV4ConfigAtBlock,
   parseAmmoraV4ConfigCreatedReceipt,
   parseAmmoraV4LaunchCreatedReceipt,
@@ -34,8 +36,8 @@ import { deriveConfigFromTemplate } from "./config-from-template";
 // GIWA Sepolia reviewed template (Config #6, concentrated graduation).
 export const TEMPLATE_ID = 6n;
 export const TEMPLATE_HASH: Hex = "0x6048908774397e0691bb0e19f72dabb790eb0d892d6081d3622b39e7f738e667";
-/** Platform fee recipient for OrbitPad Configs. */
-export const PARTNER: Address = "0x4cB75146e98562C9d79b31649C6C739e4DCB7CD5";
+/** OrbitPad platform address: platform Config owner, partner, liquidity partner and leftover receiver. */
+export const PARTNER: Address = "0x7dE71b1d5936985182d30336e1AF1Ec399b7178B";
 /** Small graduation threshold so the full lifecycle fits in a couple of testnet buys. */
 export const THRESHOLD_RAW = 10n ** 16n; // 0.01 WETH
 export const SALE_TOKENS = 100_000_000n;
@@ -86,6 +88,9 @@ export function orbitpadConfig(template: AmmoraV4ConfigSnapshot): { config: Ammo
 /** Creates the reusable OrbitPad platform Config, signed by the connected wallet (its owner). */
 export async function createPlatformConfig(log: Log): Promise<bigint> {
   const { account } = await requireWallet();
+  if (account.toLowerCase() !== PARTNER.toLowerCase()) {
+    throw new Error(`Connect the OrbitPad platform wallet ${PARTNER} to create the platform Config`);
+  }
   const block = await latestBlock();
   const { config, segments } = orbitpadConfig(await templateAt(block.number));
   log("Planning platform Config (threshold 0.01 WETH)…");
@@ -293,6 +298,7 @@ export type CurveView = {
   symbol: string;
   baseDecimals: number;
   segments: readonly AmmoraV4Segment[];
+  config: AmmoraV4Config;
 };
 
 export async function readCurve(curve: Address): Promise<CurveView> {
@@ -305,7 +311,7 @@ export async function readCurve(curve: Address): Promise<CurveView> {
     publicClient.readContract({ address: state.baseToken, abi: erc20Abi, functionName: "decimals", blockNumber }),
     getAmmoraV4ConfigAtBlock(publicClient, core.configRegistry, state.configId, blockNumber),
   ]);
-  return { state, progressBps: progressOf(state), name, symbol, baseDecimals, segments: snapshot.segments };
+  return { state, progressBps: progressOf(state), name, symbol, baseDecimals, segments: snapshot.segments, config: snapshot.config };
 }
 
 export function progressOf(state: Pick<AmmoraV4LaunchCurveState, "status" | "quoteReserve" | "migrationQuoteThreshold">): number {
@@ -411,6 +417,55 @@ export async function migrate(curve: Address, log: Log): Promise<Address> {
   }
   const after = await client.getStateAtBlock(receipt.blockNumber);
   return after.canonicalPool;
+}
+
+// ---------- Fee split / claims ----------
+
+const pct = (bps: number) => `${(bps / 100).toFixed(bps % 100 ? 2 : 0)}%`;
+
+/** Human-readable Creator/Partner economics from a Config (template #6 defaults for OrbitPad). */
+export function feeSplit(config: AmmoraV4Config): Array<[string, string]> {
+  const ld = config.liquidityDistribution;
+  const creatorLp = 10_000 - ld.partnerUnlockedBps - ld.partnerPermanentLockedBps - ld.creatorPermanentLockedBps;
+  return [
+    ["Starting trading fee", pct(config.cliffFeeBps)],
+    ["Trading fees (after protocol) → Creator", pct(config.creatorShareOfNonProtocolBps)],
+    ["Trading fees (after protocol) → Partner", pct(10_000 - config.creatorShareOfNonProtocolBps)],
+    ["Graduation fee", pct(config.migrationQuoteFeeBps)],
+    ["Graduation fee share → Creator", pct(config.creatorMigrationFeeShareBps)],
+    ["LP → Partner (unlocked / locked)", `${pct(ld.partnerUnlockedBps)} / ${pct(ld.partnerPermanentLockedBps)}`],
+    ["LP → Creator (locked / other)", `${pct(ld.creatorPermanentLockedBps)} / ${pct(creatorLp)}`],
+  ];
+}
+
+export async function templateSplit(): Promise<Array<[string, string]>> {
+  const blockNumber = await publicClient.getBlockNumber();
+  return feeSplit((await templateAt(blockNumber)).config);
+}
+
+async function factoryFeeVault(): Promise<Address> {
+  return publicClient.readContract({ address: core.launchFactory, abi: ammoraLaunchFactoryV4Abi, functionName: "feeVault" }) as Promise<Address>;
+}
+
+export type Claimable = { vault: Address; quote: bigint; base: bigint };
+
+/** Fees accrued to `beneficiary` in the launch FeeVault (quote is shared across all of their launches). */
+export async function claimableFees(state: AmmoraV4LaunchCurveState, beneficiary: Address): Promise<Claimable> {
+  const vault = await factoryFeeVault();
+  if (vault.toLowerCase() !== state.feeVault.toLowerCase()) throw new Error("Curve fee vault does not match the factory fee vault");
+  const read = (token: Address) =>
+    publicClient.readContract({ address: vault, abi: feeVaultAbi, functionName: "claimable", args: [token, beneficiary] }) as Promise<bigint>;
+  const [quote, base] = await Promise.all([read(state.quoteToken), read(state.baseToken)]);
+  return { vault, quote, base };
+}
+
+/** claimFor the connected account's own entitlement, paid to itself. One token per transaction. */
+export async function claimFees(vault: Address, token: Address, log: Log): Promise<void> {
+  const { account } = await requireWallet();
+  const owed = (await publicClient.readContract({ address: vault, abi: feeVaultAbi, functionName: "claimable", args: [token, account] })) as bigint;
+  if (owed === 0n) throw new Error("Nothing to claim for this token");
+  const tx = buildClaimFeeVaultFor(token, account, account);
+  await sendTx({ to: vault, data: tx.data }, "Claim fees", log);
 }
 
 export async function wrapEth(amount: bigint, log: Log) {

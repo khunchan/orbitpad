@@ -18,8 +18,12 @@ import {
   PARTNER,
   THRESHOLD_RAW,
   createLaunch,
+  claimFees,
+  claimableFees,
   createPlatformConfig,
   curvePoints,
+  feeSplit,
+  templateSplit,
   executeTrade,
   findLaunch,
   fmt,
@@ -50,6 +54,24 @@ const statusClass = (s: LaunchStatus) =>
   s === "Trading" ? "trading" : s === "Ready to migrate" ? "ready" : s === "Graduated" ? "graduated" : "pending";
 const statusPill = (s: LaunchStatus) => `<span class="status ${statusClass(s)}">${esc(s)}</span>`;
 const progressBar = (bps: number) => `<div class="progress" title="${(bps / 100).toFixed(1)}%"><div style="width:${Math.max(0, Math.min(100, bps / 100))}%"></div></div>`;
+
+const splitTable = (rows: Array<[string, string]>) =>
+  `<dl class="kv">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>`;
+
+function configChip(id: bigint): string {
+  return `<span class="inline"><strong>Config #${id}</strong><button type="button" class="icon small" data-copy="${id}" title="Copy Config ID">Copy</button></span>`;
+}
+document.addEventListener("click", async e => {
+  const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-copy]");
+  if (!btn) return;
+  try {
+    await navigator.clipboard.writeText(btn.dataset.copy!);
+    btn.textContent = "Copied";
+  } catch {
+    btn.textContent = "Copy failed";
+  }
+  setTimeout(() => (btn.textContent = "Copy"), 1500);
+});
 
 function errorMessage(error: unknown): string {
   const e = error as { shortMessage?: string; message?: string };
@@ -231,7 +253,9 @@ function renderLaunch(view: HTMLElement) {
             <dt>Quote asset</dt><dd>WETH</dd>
             <dt>Graduation at</dt><dd>${fmt(THRESHOLD_RAW, 18)} WETH</dd>
             <dt>Sale supply</dt><dd>100,000,000 tokens</dd>
-            <dt>Platform Config</dt><dd>${configId === null ? "not created yet" : `#${configId}`}</dd>
+            <dt>Platform Config</dt><dd id="cfg-dd">${configId === null ? "not created yet" : configChip(configId)}</dd>
+            <dt>Creator</dt><dd>you (the launching wallet)</dd>
+            <dt>Partner</dt><dd class="mono">${short(PARTNER)}</dd>
           </dl>
         </div>
         <div class="card">
@@ -243,9 +267,14 @@ function renderLaunch(view: HTMLElement) {
         </div>
         <div class="card">
           <h3>Platform Config</h3>
-          <p class="muted small" style="margin-top:0">Launches without a first buy use OrbitPad's shared Config: template #6 fees, 0.01 WETH threshold, partner fees to <code>${short(PARTNER)}</code>. Create it once from the partner wallet.</p>
-          <button id="mkconfig" ${configId === null ? "" : "disabled"}>${configId === null ? "Create platform Config" : `Config #${configId} active`}</button>
+          <p class="muted small" style="margin-top:0">Launches without a first buy use OrbitPad's shared Config: template #6 fees and split, 0.01 WETH threshold. The platform wallet <code>${short(PARTNER)}</code> owns it and is partner, liquidity partner and leftover receiver. Create it once while connected as that wallet.</p>
+          <div id="cfg-box">${configId === null ? `<button id="mkconfig">Create platform Config</button>` : configChip(configId)}</div>
           <div class="log" id="config-log"></div>
+        </div>
+        <div class="card">
+          <h3>Creator / Partner split (template #6)</h3>
+          <div id="split"><div class="skeleton"></div></div>
+          <p class="muted small" style="margin-bottom:0">Protocol fees are fixed by the deployment fee policy. Creators claim their accrued fees on the token page.</p>
         </div>
       </div>
     </div>`;
@@ -268,14 +297,23 @@ function renderLaunch(view: HTMLElement) {
     } catch (error) { out.error(error); } finally { btn.disabled = false; }
   });
 
-  view.querySelector("#mkconfig")!.addEventListener("click", async e => {
+  templateSplit().then(rows => {
+    const el = view.querySelector("#split");
+    if (el) el.innerHTML = splitTable(rows);
+  }).catch(error => {
+    const el = view.querySelector("#split");
+    if (el) el.innerHTML = `<div class="notice warn">${esc(errorMessage(error))}</div>`;
+  });
+
+  view.querySelector("#mkconfig")?.addEventListener("click", async e => {
     const btn = e.currentTarget as HTMLButtonElement;
     const out = logger(view.querySelector("#config-log")!);
     btn.disabled = true;
     try {
       const id = await createPlatformConfig(out.log);
-      btn.textContent = `Config #${id} active`;
-      out.log(`Saved locally. Share this ID with the OrbitPad maintainers to make it the site default.`);
+      view.querySelector("#cfg-box")!.innerHTML = configChip(id);
+      view.querySelector("#cfg-dd")!.innerHTML = configChip(id);
+      out.log(`Saved in this browser. Send this number to make it the site default.`);
     } catch (error) { out.error(error); btn.disabled = false; }
   });
 
@@ -385,11 +423,18 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
           <dt>Current fee</dt><dd>${(state.currentFeeBps / 100).toFixed(2)}%</dd>
           <dt>Config</dt><dd>#${state.configId}</dd>
           <dt>Creator</dt><dd><a class="mono" href="${addressUrl(state.creator)}" target="_blank" rel="noopener">${short(state.creator)}</a></dd>
+          <dt>Partner</dt><dd><a class="mono" href="${addressUrl(state.partnerRecipient)}" target="_blank" rel="noopener">${short(state.partnerRecipient)}</a></dd>
           <dt>As of block</dt><dd>${state.asOfBlock}</dd>
         </dl></div>
+        <div class="card"><h2>Creator / Partner split</h2>${splitTable(feeSplit(data.config))}</div>
       </div>
-      <div class="card" id="action"></div>
+      <div class="grid">
+        <div class="card" id="action"></div>
+        <div class="card" id="fees" hidden></div>
+      </div>
     </div>`;
+
+  renderFees(view.querySelector<HTMLElement>("#fees")!, data, token).catch(() => {});
 
   findLaunch(curve).then(row => {
     if (token !== routeToken || !row) return;
@@ -507,11 +552,50 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
   });
 }
 
+async function renderFees(box: HTMLElement, data: CurveView, token: number) {
+  const account = wallet.account;
+  const { state } = data;
+  if (!account) return;
+  const role = account.toLowerCase() === state.creator.toLowerCase() ? "Creator"
+    : account.toLowerCase() === state.partnerRecipient.toLowerCase() ? "Partner" : null;
+  if (!role) return;
+  const fees = await claimableFees(state, account);
+  if (token !== routeToken) return;
+  box.hidden = false;
+  box.innerHTML = `<h2>Your fees (${role})</h2>
+    <dl class="kv">
+      <dt>WETH (all your launches)</dt><dd>${fmt(fees.quote, 18, 8)}</dd>
+      <dt>${esc(data.symbol)}</dt><dd>${fmt(fees.base, data.baseDecimals, 4)}</dd>
+    </dl>
+    <div class="inline" style="margin-top:12px">
+      <button id="claim-q" ${fees.quote > 0n ? "" : "disabled"}>Claim WETH</button>
+      <button id="claim-b" ${fees.base > 0n ? "" : "disabled"}>Claim ${esc(data.symbol)}</button>
+    </div>
+    <p class="muted small" style="margin-bottom:0">claimFor your own share from the launch FeeVault, paid to your wallet. WETH fees from all your launches share one balance.</p>
+    <div class="log" id="claim-log"></div>`;
+  const bind = (id: string, tokenAddress: Address) => box.querySelector<HTMLButtonElement>(id)!.addEventListener("click", async e => {
+    const btn = e.currentTarget as HTMLButtonElement;
+    const out = logger(box.querySelector("#claim-log")!);
+    btn.disabled = true;
+    try {
+      await claimFees(fees.vault, tokenAddress, out.log);
+      setTimeout(() => renderFees(box, data, token), 800);
+    } catch (error) { out.error(error); btn.disabled = false; }
+  });
+  bind("#claim-q", state.quoteToken);
+  bind("#claim-b", state.baseToken);
+}
+
 // ---------- Boot ----------
 
 shell();
+let lastAccount: string | null = null;
 onWalletChange(() => {
   renderWalletButton();
+  if (wallet.account !== lastAccount) {
+    lastAccount = wallet.account;
+    if (location.hash.startsWith("#/t/")) route();
+  }
 });
 watchProvider();
 restore().catch(() => {});

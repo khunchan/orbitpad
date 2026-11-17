@@ -13,7 +13,7 @@ Live: https://orbitpad-giwa.netlify.app/
 - **Launch a token**: name, ticker, description (stored as a `data:` JSON metadata URI).
   - With a first buy: `createConfigAndPoolWithFirstBuy` — exact WETH approval → re-plan at a fresh block → `READY` → one transaction creating Config + token + first buy.
   - Without a first buy: `buildCreateAmmoraV4Launch` on the shared OrbitPad platform Config.
-- **Platform Config**: derived from reviewed template Config #6 with a 0.01 WETH graduation threshold and 100M sale supply; partner/LP/leftover recipient `0x4cB75146e98562C9d79b31649C6C739e4DCB7CD5`. Created from the site with a button.
+- **Platform Config**: derived from reviewed template Config #6 with a 0.01 WETH graduation threshold and 100M sale supply; partner/LP/leftover recipient `0x7dE71b1d5936985182d30336e1AF1Ec399b7178B`. Created from the site with a button.
 - **Recent launches** from `AmmoraDataApiClient`, falling back to `LaunchCreated` logs over RPC. Shows status (Trading / Ready to migrate / Graduated) and graduation progress.
 - **Token page**: curve status, progress, live quotes, buy/sell via `AmmoraV4LaunchCurveClient.planSwapExactInput` with exact-amount approvals and leftover-allowance cleanup, final-fill handling with `classifyAmmoraV4ExactInputFill` (partial fill only at the graduation boundary), permissionless **Migrate** via `planMigrateAtBlock`, and an SVG bonding-curve chart with the current point.
 - Deterministic 8×8 pixel avatar per token address (nothing stored).
