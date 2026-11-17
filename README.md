@@ -25,6 +25,7 @@ Live: https://khunchan.github.io/orbitpad/
 npm ci --ignore-scripts
 npm run dev
 npm run build
+npm run deploy   # publish dist/ to the gh-pages branch
 ```
 
 `src/config-from-template.ts` is adapted from [AmmoraLabs/ammora-examples](https://github.com/AmmoraLabs/ammora-examples) (MIT).
