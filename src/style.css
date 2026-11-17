@@ -176,7 +176,7 @@ footer.foot .links { display: flex; gap: 16px; flex-wrap: wrap; }
   #connect { padding: 8px 12px; }
 }
 
-.quick { display: flex; gap: 6px; flex-wrap: wrap; }
+.quick { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 .quick button { padding: 4px 10px; font-size: 12px; border-radius: 999px; background: var(--card-2); }
 .quick button:hover { border-color: var(--teal); }
 
