@@ -6,6 +6,8 @@ import {
   buildCreateAmmoraV4Launch,
   classifyAmmoraV4ExactInputFill,
   createConfigAndPoolWithFirstBuy,
+  deltaQuote,
+  excludeAmmoraFee,
   feeVaultAbi,
   getAmmoraV4ConfigAtBlock,
   parseAmmoraV4ConfigCreatedReceipt,
@@ -13,6 +15,7 @@ import {
   parseAmmoraV4MigratedReceipt,
   parseAmmoraV4SwapReceipt,
   planCreateAmmoraV4Config,
+  segmentedExactInput,
   type AmmoraV4Config,
   type AmmoraV4ConfigSnapshot,
   type AmmoraV4LaunchCurveState,
@@ -119,21 +122,40 @@ export function parseMetadata(uri: string): { description?: string } {
   return {};
 }
 
-const Q64 = 1n << 64n;
+/** Conservative fee for the first buy: scheduler cliff fee, plus headroom if dynamic fees can add more. */
+const firstBuyFeeBps = (config: AmmoraV4Config) => BigInt(config.cliffFeeBps) + (config.dynamicFeeEnabled ? 100n : 0n);
 
-/** Fee-free exact-input estimate along one curve segment set, starting at its lower bound. */
-function estimateBaseOut(segments: readonly AmmoraV4Segment[], quoteIn: bigint): bigint {
-  let remaining = quoteIn;
-  let out = 0n;
-  for (const seg of segments) {
-    if (remaining <= 0n) break;
-    const maxQuote = seg.liquidity * (seg.upperSqrtPrice - seg.lowerSqrtPrice) / Q64;
-    const used = remaining < maxQuote ? remaining : maxQuote;
-    const next = seg.lowerSqrtPrice + used * Q64 / seg.liquidity;
-    out += seg.liquidity * Q64 * (next - seg.lowerSqrtPrice) / (seg.lowerSqrtPrice * next);
-    remaining -= used;
-  }
-  return out;
+/**
+ * Expected first-buy output on a fresh curve (starting at startSqrtPrice), via the SDK's exact segmented math.
+ * Fee is excluded from the input first; minimum applies the user's slippage on top.
+ */
+export function firstBuyQuote(config: AmmoraV4Config, segments: readonly AmmoraV4Segment[], includedQuoteIn: bigint, slippageBps: number) {
+  const feeBps = firstBuyFeeBps(config);
+  const { excluded } = excludeAmmoraFee(includedQuoteIn, feeBps);
+  const swap = segmentedExactInput([...segments], config.startSqrtPrice, excluded, false);
+  const minimum = swap.amountOut * BigInt(10_000 - slippageBps) / 10_000n;
+  return { feeBps, excluded, expectedOut: swap.amountOut, minimum, amountLeft: swap.amountLeft };
+}
+
+/**
+ * Largest first buy that leaves the curve below its graduation threshold. Graduation must be a separate
+ * final fill + migrate, so the creation transaction itself may not fill the curve. Conservative in both
+ * fee collection modes: the quote reserve can never reach the threshold from this input.
+ */
+export const maxFirstBuyRaw = (config: AmmoraV4Config, segments?: readonly AmmoraV4Segment[]) => {
+  // Fee-free capacity of the whole curve (even a min-fee first swap cannot exceed it), minus a dust margin.
+  const capacity = segments?.length
+    ? segments.reduce((sum, seg) => sum + deltaQuote(seg.lowerSqrtPrice, seg.upperSqrtPrice, seg.liquidity, false), 0n)
+    : config.migrationQuoteThreshold;
+  const limit = capacity < config.migrationQuoteThreshold ? capacity : config.migrationQuoteThreshold;
+  return (limit - 10n ** 12n) / 10n ** 12n * 10n ** 12n; // round down to 0.000001 WETH
+};
+
+/** OrbitPad first-buy economics at the latest block, for the launch form. */
+export async function firstBuyContext() {
+  const blockNumber = await publicClient.getBlockNumber();
+  const { config, segments } = orbitpadConfig(await templateAt(blockNumber));
+  return { config, segments, max: maxFirstBuyRaw(config, segments) };
 }
 
 export async function createLaunch(input: LaunchInput, log: Log): Promise<{ token: Address; curve: Address }> {
@@ -160,7 +182,6 @@ export async function createLaunch(input: LaunchInput, log: Log): Promise<{ toke
 
 /** Atomic path: approval (if needed) → replan at a fresh block → READY → one Config+token+first-buy transaction. */
 async function createWithFirstBuy(account: Address, input: LaunchInput, uri: string, log: Log) {
-  if (input.firstBuyRaw >= THRESHOLD_RAW) throw new Error("First buy must be below the 0.01 WETH graduation threshold");
   const wethBalance = await publicClient.readContract({ address: WETH, abi: erc20Abi, functionName: "balanceOf", args: [account] });
   if (wethBalance < input.firstBuyRaw) throw new Error("Not enough WETH. Use “Wrap ETH → WETH” first.");
 
@@ -168,10 +189,15 @@ async function createWithFirstBuy(account: Address, input: LaunchInput, uri: str
     const block = await latestBlock();
     const template = await templateAt(block.number);
     const { config, segments } = orbitpadConfig(template);
-    const feeBps = BigInt(config.cliffFeeBps);
-    const estimate = estimateBaseOut(segments, input.firstBuyRaw * (10_000n - feeBps) / 10_000n);
-    const minimum = estimate * BigInt(10_000 - input.slippageBps) / 10_000n;
-    if (minimum <= 0n) throw new Error("First buy too small to receive tokens");
+    const max = maxFirstBuyRaw(config, segments);
+    if (input.firstBuyRaw > max) {
+      throw new Error(`First buy can be at most ${fmt(max, 18)} WETH: it may not fill the curve`);
+    }
+    const q = firstBuyQuote(config, segments, input.firstBuyRaw, input.slippageBps);
+    log(`Quote @${block.number}: ${fmt(input.firstBuyRaw, 18)} WETH (fee ≤${Number(q.feeBps) / 100}%) → ≈${fmt(q.expectedOut, config.tokenDecimals, 2)} ${input.symbol}, minOut ${fmt(q.minimum, config.tokenDecimals, 2)}`);
+    if (q.amountLeft > 0n) throw new Error("First buy would fill the curve; use a smaller amount");
+    if (q.minimum <= 0n) throw new Error("First buy too small to receive tokens");
+    const minimum = q.minimum;
     const fees = await publicClient.estimateFeesPerGas();
     return createConfigAndPoolWithFirstBuy(publicClient, {
       account,
@@ -506,17 +532,16 @@ export function priceFromSqrt(sqrtPrice: bigint, baseDecimals: number, quoteDeci
   return s * s * 10 ** (baseDecimals - quoteDecimals);
 }
 
-/** Points along the curve: x = WETH raised, y = price. */
+/** Points along the curve: x = WETH raised, y = price. Amounts use the SDK's Q64 liquidity math. */
 export function curvePoints(segments: readonly AmmoraV4Segment[], baseDecimals: number, samples = 64) {
   const points: Array<{ x: number; y: number }> = [];
   let raised = 0;
   for (const seg of segments) {
     for (let i = 0; i <= samples; i++) {
       const s = seg.lowerSqrtPrice + (seg.upperSqrtPrice - seg.lowerSqrtPrice) * BigInt(i) / BigInt(samples);
-      const quote = Number(seg.liquidity * (s - seg.lowerSqrtPrice) / Q64) / 1e18;
-      points.push({ x: raised + quote, y: priceFromSqrt(s, baseDecimals) });
+      points.push({ x: raised + Number(deltaQuote(seg.lowerSqrtPrice, s, seg.liquidity, false)) / 1e18, y: priceFromSqrt(s, baseDecimals) });
     }
-    raised += Number(seg.liquidity * (seg.upperSqrtPrice - seg.lowerSqrtPrice) / Q64) / 1e18;
+    raised += Number(deltaQuote(seg.lowerSqrtPrice, seg.upperSqrtPrice, seg.liquidity, false)) / 1e18;
   }
   return points;
 }
@@ -525,7 +550,7 @@ export function raisedAt(segments: readonly AmmoraV4Segment[], sqrtPrice: bigint
   let raised = 0;
   for (const seg of segments) {
     const upper = sqrtPrice < seg.upperSqrtPrice ? sqrtPrice : seg.upperSqrtPrice;
-    if (upper > seg.lowerSqrtPrice) raised += Number(seg.liquidity * (upper - seg.lowerSqrtPrice) / Q64) / 1e18;
+    if (upper > seg.lowerSqrtPrice) raised += Number(deltaQuote(seg.lowerSqrtPrice, upper, seg.liquidity, false)) / 1e18;
   }
   return raised;
 }

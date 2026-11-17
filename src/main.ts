@@ -23,6 +23,8 @@ import {
   createPlatformConfig,
   curvePoints,
   feeSplit,
+  firstBuyContext,
+  firstBuyQuote,
   templateSplit,
   executeTrade,
   findLaunch,
@@ -274,7 +276,8 @@ function renderLaunch(view: HTMLElement) {
         <div class="field"><label for="desc">Description</label><textarea id="desc" maxlength="280" placeholder="What is this token about?"></textarea></div>
         <div class="field"><label for="first">First buy (WETH, optional)</label>
           <input id="first" inputmode="decimal" placeholder="0.002" />
-          <span class="muted small">With a first buy, a new OrbitPad Config, your token and the first buy are created atomically in one transaction (after an exact WETH approval). Must be below 0.01 WETH.</span>
+          <span class="muted small" id="first-est"></span>
+          <span class="muted small" id="first-hint">With a first buy, a new OrbitPad Config, your token and the first buy are created atomically in one transaction (after an exact WETH approval).</span>
         </div>
         <div class="field"><label for="slip">Slippage for first buy (%)</label><input id="slip" inputmode="decimal" value="5" /></div>
         <button class="primary" type="submit" style="width:100%">Launch</button>
@@ -331,6 +334,32 @@ function renderLaunch(view: HTMLElement) {
       await showBalances();
     } catch (error) { out.error(error); } finally { btn.disabled = false; }
   });
+
+  const firstInput = view.querySelector<HTMLInputElement>("#first")!;
+  const slipInputL = view.querySelector<HTMLInputElement>("#slip")!;
+  const est = view.querySelector<HTMLElement>("#first-est")!;
+  const ctx = firstBuyContext();
+  ctx.then(({ max }) => {
+    firstInput.placeholder = `up to ${fmt(max, 18)}`;
+    view.querySelector("#first-hint")!.innerHTML += ` <strong>Max ${fmt(max, 18)} WETH.</strong> The first buy can't fill the curve: reaching the ${fmt(THRESHOLD_RAW, 18)} WETH threshold starts graduation, which must be its own final buy and a separate migrate transaction.`;
+  }).catch(() => {});
+  const showEstimate = async () => {
+    const raw = firstInput.value.trim();
+    if (!raw || Number(raw) <= 0) { est.textContent = ""; return; }
+    try {
+      const { config, segments, max } = await ctx;
+      const amount = parseUnits(raw, 18);
+      if (amount > max) { est.innerHTML = `<span style="color:var(--warn)">Above the ${fmt(max, 18)} WETH maximum.</span>`; return; }
+      const slip = Math.round(Number(slipInputL.value || "5") * 100);
+      const q = firstBuyQuote(config, segments, amount, slip);
+      const sym = esc(view.querySelector<HTMLInputElement>("#ticker")!.value.trim().toUpperCase() || "tokens");
+      est.innerHTML = `≈ ${fmt(q.expectedOut, config.tokenDecimals, 0)} ${sym} · min ${fmt(q.minimum, config.tokenDecimals, 0)} after ${(slip / 100).toFixed(2)}% slippage (fee ${Number(q.feeBps) / 100}%)`;
+    } catch (error) {
+      est.textContent = errorMessage(error);
+    }
+  };
+  firstInput.addEventListener("input", showEstimate);
+  slipInputL.addEventListener("input", showEstimate);
 
   templateSplit().then(rows => {
     const el = view.querySelector("#split");
