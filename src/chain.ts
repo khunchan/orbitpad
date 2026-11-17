@@ -18,12 +18,12 @@ import { giwaSepoliaAutoRouteDeployment } from "@ammora-protocol/sdk";
 
 export const deployment = giwaSepoliaAutoRouteDeployment;
 export const launch = deployment.contracts.launch;
+/** GIWA's official public RPC: left to the wallet (it shares a per-IP rate limit with this page). */
 export const RPC_URL = "https://sepolia-rpc.giwa.io";
-/** Backups: GIWA's Flashblocks endpoint and Pocket Network's public GIWA Sepolia endpoint. */
-export const FALLBACK_RPC_URLS = [
-  "https://sepolia-rpc-flashblocks.giwa.io",
-  "https://giwa-sepolia-testnet.api.pocket.network",
-] as const;
+const FLASHBLOCKS_RPC_URL = "https://sepolia-rpc-flashblocks.giwa.io";
+const POCKET_RPC_URL = "https://giwa-sepolia-testnet.api.pocket.network";
+/** Site reads: Pocket first, then GIWA Flashblocks, and the official RPC only as a last resort. */
+export const SITE_RPC_URLS = [POCKET_RPC_URL, FLASHBLOCKS_RPC_URL, RPC_URL] as const;
 export const EXPLORER = "https://sepolia-explorer.giwa.io";
 export const WETH: Address = "0x4200000000000000000000000000000000000006";
 export const DATA_API = "https://ammora-giwa-sepolia-data.fly.dev";
@@ -32,10 +32,13 @@ export const giwaSepolia = defineChain({
   id: 91342,
   name: "GIWA Sepolia",
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-  rpcUrls: { default: { http: [RPC_URL, ...FALLBACK_RPC_URLS] } },
+  rpcUrls: { default: { http: [...SITE_RPC_URLS] } },
   blockExplorers: { default: { name: "GIWA Explorer", url: EXPLORER } },
   testnet: true,
 });
+
+/** Network definition handed to the wallet (wallet_addEthereumChain): official RPC first, not the site's main RPC. */
+const giwaSepoliaForWallet = defineChain({ ...giwaSepolia, rpcUrls: { default: { http: [RPC_URL, FLASHBLOCKS_RPC_URL] } } });
 
 if (deployment.chain.id !== giwaSepolia.id || launch.protocolVersion !== 4) {
   throw new Error("OrbitPad requires the GIWA Sepolia V4 auto-route deployment");
@@ -67,7 +70,7 @@ const rpc = (url: string) => http(url, {
 
 export const publicClient = createPublicClient({
   chain: giwaSepolia,
-  transport: fallback([rpc(RPC_URL), ...FALLBACK_RPC_URLS.map(rpc)], { retryCount: 1, retryDelay: 500 }),
+  transport: fallback(SITE_RPC_URLS.map(rpc), { retryCount: 1, retryDelay: 500 }),
 });
 
 export const core = {
@@ -117,7 +120,7 @@ export async function switchNetwork(): Promise<void> {
   } catch (error) {
     const code = (error as { code?: number; cause?: { code?: number } }).code ?? (error as { cause?: { code?: number } }).cause?.code;
     if (code !== 4902 && !/unrecognized|not added|unknown chain/i.test(String((error as Error).message))) throw error;
-    await client.addChain({ chain: giwaSepolia });
+    await client.addChain({ chain: giwaSepoliaForWallet });
     await client.switchChain({ id: giwaSepolia.id });
   }
   wallet.chainId = await client.getChainId();
@@ -155,6 +158,49 @@ export async function requireWallet(): Promise<{ client: WalletClient; account: 
   if (!wallet.client || !wallet.account) throw new Error("Wallet not connected");
   if (wallet.chainId !== giwaSepolia.id) throw new Error("Switch your wallet to GIWA Sepolia");
   return { client: wallet.client, account: wallet.account };
+}
+
+// ---------- Background gate ----------
+
+let walletPrompts = 0;
+const resumeWaiters: Array<() => void> = [];
+const resumeBackground = () => {
+  if (walletPrompts === 0 && !document.hidden) resumeWaiters.splice(0).forEach(resolve => resolve());
+};
+if (typeof document !== "undefined") document.addEventListener("visibilitychange", resumeBackground);
+
+/**
+ * Background work (list loading, live quotes, balance panels, post-tx re-render) waits here while a
+ * wallet confirmation is open or the tab is hidden, so the page doesn't eat the wallet's RPC limit.
+ */
+export async function backgroundGate(): Promise<void> {
+  while (walletPrompts > 0 || (typeof document !== "undefined" && document.hidden)) {
+    await new Promise<void>(resolve => resumeWaiters.push(resolve));
+  }
+}
+
+/** Marks a wallet interaction (simulate → sign → receipt); background reads pause until it ends. */
+export async function withWalletPrompt<T>(fn: () => Promise<T>): Promise<T> {
+  walletPrompts++;
+  try {
+    return await fn();
+  } catch (error) {
+    throw friendlyWalletError(error);
+  } finally {
+    walletPrompts--;
+    resumeBackground();
+  }
+}
+
+const RATE_LIMIT = /rate.?limit|over rate|too many requests|429|-32005|limit exceeded|request limit/i;
+/** Maps a wallet-side RPC throttle to an actionable message; other errors pass through unchanged. */
+export function friendlyWalletError(error: unknown): unknown {
+  for (let e = error as { message?: string; details?: string; code?: number; cause?: unknown } | undefined; e; e = e.cause as typeof e) {
+    if (e.code === -32005 || e.code === 429 || RATE_LIMIT.test(`${e.message ?? ""} ${e.details ?? ""}`)) {
+      return new Error("Wallet RPC is rate-limited, wait a few seconds and try again", { cause: error });
+    }
+  }
+  return error;
 }
 
 // ---------- Read-after-write consistency ----------
@@ -246,6 +292,12 @@ export type Tx = { to: Address; data: Hex; value?: bigint };
 
 /** Simulates against the latest state, asks the wallet to sign, then waits for a successful receipt. */
 export async function sendTx(tx: Tx, label: string, log: (msg: string) => void): Promise<TransactionReceipt> {
+  const receipt = await withWalletPrompt(() => signAndWait(tx, label, log));
+  await afterConfirmed(receipt, label, log);
+  return receipt;
+}
+
+async function signAndWait(tx: Tx, label: string, log: (msg: string) => void): Promise<TransactionReceipt> {
   const { client, account } = await requireWallet();
   log(`${label}: simulating…`);
   await publicClient.call({ account, to: tx.to, data: tx.data, value: tx.value });
@@ -255,7 +307,6 @@ export async function sendTx(tx: Tx, label: string, log: (msg: string) => void):
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") throw new Error(`${label} reverted (${hash})`);
   log(`${label}: confirmed in block ${receipt.blockNumber}`);
-  await afterConfirmed(receipt, label, log);
   return receipt;
 }
 

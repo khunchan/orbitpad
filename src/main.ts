@@ -5,6 +5,7 @@ import {
   connect,
   giwaSepolia,
   hasWallet,
+  backgroundGate,
   nativeBalance,
   onTxConfirmed,
   onWalletChange,
@@ -52,6 +53,7 @@ import {
   preparePoolSwap,
   quoteToGraduate,
   gasReserve,
+  invalidateRows,
   readPool,
   valueAtSqrtPrice,
   unwrapWeth,
@@ -101,6 +103,10 @@ function isRpcError(error: unknown): boolean {
 }
 
 function errorMessage(error: unknown): string {
+  const raw = (error as { message?: string })?.message ?? "";
+  if (!/^Wallet RPC is rate-limited/.test(raw) && /rate.?limit|over rate|too many requests|\b429\b/i.test(`${raw} ${(error as { details?: string })?.details ?? ""}`)) {
+    return "Network RPC is rate-limited, wait a few seconds and try again";
+  }
   const e = error as { shortMessage?: string; message?: string };
   return (e?.shortMessage ?? e?.message ?? String(error)).split("\n")[0]!;
 }
@@ -149,6 +155,8 @@ onTxConfirmed(() => {
 });
 /** Re-renders the current page (all reads wait for the last receipt block) and keeps log panels. */
 async function refresh() {
+  await backgroundGate(); // after the wallet closes and while the tab is visible
+  invalidateRows();
   const logs = new Map<string, string>();
   document.querySelectorAll<HTMLElement>(".log.show[id]").forEach(el => logs.set(el.id, el.innerHTML));
   await route({ keepScroll: true });
@@ -173,6 +181,8 @@ function wrapForBuy(box: HTMLElement, logId: string, continueBuy: (out: ReturnTy
   return async (amountIn: bigint | null) => {
     const mine = ++seq;
     if (!amountIn || amountIn <= 0n || !wallet.account) { box.innerHTML = ""; return; }
+    await backgroundGate();
+    if (mine !== seq) return;
     const need = await wrapShortfall(wallet.account, amountIn);
     if (mine !== seq) return;
     if (need.missing === 0n) { box.innerHTML = ""; return; }
@@ -284,6 +294,7 @@ function toggleWalletPanel(open = panel().hidden) {
 }
 
 async function loadWalletPanel() {
+  await backgroundGate();
   const account = wallet.account;
   if (!account || panel().hidden) return;
   document.getElementById("wp-addr")!.textContent = short(account);
@@ -843,6 +854,8 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
   const refreshQuote = async () => {
     updateWrapRef();
     const seq = ++quoteSeq;
+    await backgroundGate();
+    if (seq !== quoteSeq) return;
     const raw = amt.value.trim();
     if (!raw || Number(raw) <= 0) { quoteEl.className = "notice"; quoteEl.textContent = "Enter an amount for a live quote."; return; }
     try {
@@ -865,7 +878,7 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
     }
   };
   let timer: number | undefined;
-  const debounced = () => { clearTimeout(timer); timer = window.setTimeout(refreshQuote, 350); };
+  const debounced = () => { clearTimeout(timer); timer = window.setTimeout(refreshQuote, 600); };
   amt.addEventListener("input", debounced);
   slipInput.addEventListener("input", debounced);
   bindQuick(action.querySelector<HTMLElement>("#quick")!, amt, async () => {
@@ -948,6 +961,8 @@ function renderPoolTrade(action: HTMLElement, data: CurveView) {
   const refresh = async () => {
     updateWrap();
     const mine = ++seq;
+    await backgroundGate();
+    if (mine !== seq) return;
     const raw = amt.value.trim();
     if (!raw || Number(raw) <= 0) { quoteEl.className = "notice"; quoteEl.textContent = "Enter an amount for a live pool quote."; return; }
     try {
@@ -969,7 +984,7 @@ function renderPoolTrade(action: HTMLElement, data: CurveView) {
     }
   };
   let timer: number | undefined;
-  const debounced = () => { clearTimeout(timer); timer = window.setTimeout(refresh, 400); };
+  const debounced = () => { clearTimeout(timer); timer = window.setTimeout(refresh, 600); };
   amt.addEventListener("input", debounced);
   slipInput.addEventListener("input", debounced);
   bindQuick(action.querySelector<HTMLElement>("#pquick")!, amt, async () => {

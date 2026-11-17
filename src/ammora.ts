@@ -34,7 +34,9 @@ import {
   giwaSepolia,
   launch,
   afterConfirmed,
+  backgroundGate,
   balanceOf,
+  withWalletPrompt,
   nativeBalance,
   deployment,
   freshBlockNumber,
@@ -409,15 +411,34 @@ export function progressOf(state: Pick<AmmoraV4LaunchCurveState, "status" | "quo
   return Math.min(10_000, bps);
 }
 
-/** Lightweight list status: state + token symbol. */
-export async function readRowState(curve: Address): Promise<{ state: AmmoraV4LaunchCurveState; name: string; symbol: string }> {
-  const state = await curveClient(curve).getStateAtBlock(await freshBlockNumber());
-  const [name, symbol] = await Promise.all([
-    publicClient.readContract({ address: state.baseToken, abi: erc20Abi, functionName: "name" }),
-    publicClient.readContract({ address: state.baseToken, abi: erc20Abi, functionName: "symbol" }),
-  ]);
-  return { state, name, symbol };
+const ROW_TTL_MS = 30_000;
+const rowStates = new Map<string, { state: AmmoraV4LaunchCurveState; at: number }>();
+const tokenNames = new Map<string, { name: string; symbol: string }>();
+
+/** Lightweight list status: state (cached 30 s, waits for the background gate) + token name (cached). */
+export async function readRowState(curve: Address, maxAgeMs = ROW_TTL_MS): Promise<{ state: AmmoraV4LaunchCurveState; name: string; symbol: string }> {
+  const key = curve.toLowerCase();
+  let entry = rowStates.get(key);
+  if (!entry || Date.now() - entry.at > maxAgeMs) {
+    await backgroundGate();
+    entry = { state: await curveClient(curve).getStateAtBlock(await freshBlockNumber()), at: Date.now() };
+    rowStates.set(key, entry);
+  }
+  const state = entry.state;
+  let names = tokenNames.get(state.baseToken.toLowerCase());
+  if (!names) {
+    const [name, symbol] = await Promise.all([
+      publicClient.readContract({ address: state.baseToken, abi: erc20Abi, functionName: "name" }),
+      publicClient.readContract({ address: state.baseToken, abi: erc20Abi, functionName: "symbol" }),
+    ]);
+    names = { name, symbol };
+    tokenNames.set(state.baseToken.toLowerCase(), names);
+  }
+  return { state, ...names };
 }
+
+/** Drops cached list state after one of our transactions so the list shows it. */
+export const invalidateRows = () => rowStates.clear();
 
 // ---------- Trading ----------
 
@@ -539,7 +560,7 @@ export async function executePoolSwap(pool: Address, tokenIn: Address, amountIn:
   const prepared = await preparePoolSwap(pool, tokenIn, amountIn, slippageBps, account);
   if (prepared.quote.remainderAmountIn > 0n) throw new Error("Pool cannot fill this amount in full; try a smaller amount");
   const spenders = prepared.approvalRequirements.map(r => r.spender);
-  const result = await prepared.execute(client, {
+  const result = await withWalletPrompt(() => prepared.execute(client, {
     autoRefresh: true,
     sendApprovals: true,
     exactApproval: true,
@@ -552,7 +573,7 @@ export async function executePoolSwap(pool: Address, tokenIn: Address, amountIn:
       else if (status.type === "swap-submitted") log(`Swap submitted ${status.hash.slice(0, 10)}…`);
       else if (status.type === "swap-confirmed") log(`Swap confirmed in block ${status.blockNumber}`);
     },
-  });
+  }));
   for (const spender of spenders) await revokeLeftover(tokenIn, spender, log);
   await afterConfirmed(result.receipt, "Pool swap", log);
   return result;
