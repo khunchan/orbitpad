@@ -45,6 +45,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; }
 body {
   background: var(--bg-glow), var(--bg);
@@ -112,6 +113,9 @@ main { padding: 28px 0 48px; }
 .launch-card:hover { border-color: var(--violet); text-decoration: none; transform: translateY(-2px); }
 .launch-card .row1 { display: flex; gap: 12px; align-items: center; min-width: 0; }
 .launch-card .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#list[data-filter="orbitpad"] .launch-card:not(.ours) { display: none; }
+#list .launch-card.ours { order: -1; }
+.loading-card { pointer-events: none; }
 .pixel { border-radius: 12px; flex: none; image-rendering: pixelated; }
 
 .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px; white-space: nowrap; }

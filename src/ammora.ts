@@ -41,11 +41,12 @@ export const PARTNER: Address = "0x7dE71b1d5936985182d30336e1AF1Ec399b7178B";
 /** Small graduation threshold so the full lifecycle fits in a couple of testnet buys. */
 export const THRESHOLD_RAW = 10n ** 16n; // 0.01 WETH
 export const SALE_TOKENS = 100_000_000n;
-/** OrbitPad's platform Config, created from the site by the partner wallet. null until registered. */
-export const ORBITPAD_CONFIG_ID: bigint | null = null;
+/** OrbitPad's platform Config #46 (owner/partner = PARTNER, created at block 41534300). */
+export const ORBITPAD_CONFIG_ID: bigint | null = 46n;
 
 const CONFIG_KEY = "orbitpad-config-id";
 export function platformConfigId(): bigint | null {
+  if (ORBITPAD_CONFIG_ID !== null) return ORBITPAD_CONFIG_ID;
   try {
     const stored = localStorage.getItem(CONFIG_KEY);
     if (stored && /^\d+$/.test(stored)) return BigInt(stored);
@@ -312,6 +313,20 @@ export async function readCurve(curve: Address): Promise<CurveView> {
     getAmmoraV4ConfigAtBlock(publicClient, core.configRegistry, state.configId, blockNumber),
   ]);
   return { state, progressBps: progressOf(state), name, symbol, baseDecimals, segments: snapshot.segments, config: snapshot.config };
+}
+
+/** OrbitPad launch: on the platform Config, or an atomic first-buy Config whose partner is the platform. */
+export const isOrbitPadLaunch = (state: Pick<AmmoraV4LaunchCurveState, "configId" | "partnerRecipient">) =>
+  state.configId === ORBITPAD_CONFIG_ID || state.partnerRecipient.toLowerCase() === PARTNER.toLowerCase();
+
+/** Exact percentage string that stays readable for tiny progress against huge thresholds. */
+export function progressText(state: Pick<AmmoraV4LaunchCurveState, "status" | "quoteReserve" | "migrationQuoteThreshold">): string {
+  if (state.status >= 2) return "100%";
+  if (state.migrationQuoteThreshold === 0n || state.quoteReserve === 0n) return "0%";
+  const ppm = state.quoteReserve * 1_000_000n / state.migrationQuoteThreshold; // parts per million
+  if (ppm === 0n) return "<0.0001%";
+  if (ppm < 100n) return `${(Number(ppm) / 10_000).toFixed(4)}%`;
+  return `${(Number(ppm) / 10_000).toFixed(1)}%`;
 }
 
 export function progressOf(state: Pick<AmmoraV4LaunchCurveState, "status" | "quoteReserve" | "migrationQuoteThreshold">): number {

@@ -38,6 +38,8 @@ import {
   recentLaunches,
   statusLabel,
   progressOf,
+  progressText,
+  isOrbitPadLaunch,
   tokenBalance,
   wrapEth,
   type CurveView,
@@ -53,7 +55,7 @@ const esc = (value: unknown) =>
 const statusClass = (s: LaunchStatus) =>
   s === "Trading" ? "trading" : s === "Ready to migrate" ? "ready" : s === "Graduated" ? "graduated" : "pending";
 const statusPill = (s: LaunchStatus) => `<span class="status ${statusClass(s)}">${esc(s)}</span>`;
-const progressBar = (bps: number) => `<div class="progress" title="${(bps / 100).toFixed(1)}%"><div style="width:${Math.max(0, Math.min(100, bps / 100))}%"></div></div>`;
+const progressBar = (bps: number) => `<div class="progress"><div style="width:${Math.max(0, Math.min(100, bps / 100))}%"></div></div>`;
 
 const splitTable = (rows: Array<[string, string]>) =>
   `<dl class="kv">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>`;
@@ -169,6 +171,9 @@ function route() {
 
 // ---------- Home ----------
 
+type ListFilter = "orbitpad" | "all";
+let listFilter: ListFilter = "orbitpad";
+
 async function renderHome(view: HTMLElement, token: number) {
   view.innerHTML = `
     <section class="hero">
@@ -177,49 +182,79 @@ async function renderHome(view: HTMLElement, token: number) {
       <p>Create a token on an Ammora bonding curve, trade it, and graduate it to a pool once it raises 0.01 WETH — every transaction signed in your own wallet.</p>
       <div class="inline" style="margin-top:18px"><a class="btn primary" href="#/launch" style="color:#fff;background:var(--grad);border:0">Launch a token</a></div>
     </section>
-    <div class="section-head"><h2>Recent launches</h2><span class="muted small" id="src"></span></div>
-    <div class="grid launches" id="list">${Array.from({ length: 6 }, () => `<div class="card"><div class="skeleton" style="width:60%"></div><div class="skeleton" style="margin-top:12px"></div></div>`).join("")}</div>`;
-  const list = view.querySelector<HTMLElement>("#list")!;
-  try {
-    const { rows, source, apiStatus } = await recentLaunches(24);
-    if (token !== routeToken) return;
-    view.querySelector("#src")!.textContent = source === "api" ? "via Ammora Data API" : "via on-chain LaunchCreated events";
-    if (!rows.length) {
-      list.innerHTML = `<div class="card muted">No launches found yet. Be the first — <a href="#/launch">launch a token</a>.</div>`;
-      return;
-    }
-    list.innerHTML = rows.map(r => `
-      <a class="card launch-card" href="#/t/${r.curve}" data-curve="${r.curve}">
-        <div class="row1">${pixelAvatar(r.token, 44)}
-          <div style="min-width:0;flex:1"><div class="name" data-f="name">${esc(short(r.token))}</div>
-          <div class="muted small" data-f="sym">Config #${r.configId}</div></div>
-          <span data-f="status">${statusPill(apiStatus?.[r.curve.toLowerCase()] ?? "Pending")}</span>
+    <div class="section-head"><h2>Recent launches</h2>
+      <div class="inline"><span class="muted small" id="src"></span>
+        <div class="tabs" style="margin:0" role="tablist">
+          <button data-filter="orbitpad" class="${listFilter === "orbitpad" ? "on" : ""}">OrbitPad</button>
+          <button data-filter="all" class="${listFilter === "all" ? "on" : ""}">All</button>
         </div>
-        <div data-f="bar">${progressBar(0)}</div>
-        <div class="muted small" data-f="pct">Loading curve…</div>
+      </div>
+    </div>
+    <div class="grid launches" id="list" data-filter="${listFilter}">${Array.from({ length: 6 }, () => `<div class="card loading-card"><div class="skeleton" style="width:60%"></div><div class="skeleton" style="margin-top:12px"></div></div>`).join("")}</div>
+    <div class="card muted" id="empty" hidden></div>`;
+  const list = view.querySelector<HTMLElement>("#list")!;
+  const empty = view.querySelector<HTMLElement>("#empty")!;
+  let pending = 0;
+
+  const updateEmpty = () => {
+    const visible = list.querySelectorAll(listFilter === "orbitpad" ? ".launch-card.ready-row.ours" : ".launch-card.ready-row").length;
+    const loading = pending > 0;
+    empty.hidden = visible > 0 || loading;
+    empty.innerHTML = listFilter === "orbitpad"
+      ? `No OrbitPad launches yet. <a href="#/launch">Launch the first one</a>.`
+      : "No readable launches found.";
+  };
+  view.querySelectorAll<HTMLButtonElement>("[data-filter]").forEach(b => b.addEventListener("click", () => {
+    listFilter = b.dataset.filter as ListFilter;
+    list.dataset.filter = listFilter;
+    view.querySelectorAll("[data-filter] ").forEach(x => x.classList.toggle("on", x === b));
+    updateEmpty();
+  }));
+
+  try {
+    const { rows, source } = await recentLaunches(40);
+    if (token !== routeToken) return;
+    view.querySelector("#src")!.textContent = source === "api" ? "via Ammora Data API" : "via on-chain events";
+    list.innerHTML = rows.map(r => `
+      <a class="card launch-card" href="#/t/${r.curve}" data-curve="${r.curve}" hidden>
+        <div class="row1">${pixelAvatar(r.token, 44)}
+          <div style="min-width:0;flex:1"><div class="name" data-f="name"></div>
+          <div class="muted small" data-f="sym"></div></div>
+          <span data-f="status"></span>
+        </div>
+        <div data-f="bar"></div>
+        <div class="muted small" data-f="pct"></div>
       </a>`).join("");
-    // Fill in on-chain status/progress progressively, a few at a time.
+    pending = rows.length;
+    updateEmpty();
+    // Fill in on-chain status/progress; unreadable curves (other generations/launchpads) are dropped.
     const queue = [...rows];
     const worker = async () => {
       for (let r = queue.shift(); r; r = queue.shift()) {
         if (token !== routeToken) return;
         const card = list.querySelector<HTMLElement>(`[data-curve="${r.curve}"]`);
-        if (!card) continue;
         try {
           const { state, name, symbol } = await readRowState(r.curve);
-          const bps = progressOf(state);
+          if (!card || token !== routeToken) continue;
+          const ours = isOrbitPadLaunch(state);
+          card.classList.add("ready-row");
+          if (ours) card.classList.add("ours");
           card.querySelector("[data-f=name]")!.textContent = name;
-          card.querySelector("[data-f=sym]")!.textContent = `$${symbol}`;
+          card.querySelector("[data-f=sym]")!.textContent = `$${symbol}${ours ? "" : ` · Config #${state.configId}`}`;
           card.querySelector("[data-f=status]")!.innerHTML = statusPill(statusLabel(state.status));
-          card.querySelector("[data-f=bar]")!.innerHTML = progressBar(bps);
+          card.querySelector("[data-f=bar]")!.innerHTML = progressBar(progressOf(state));
           card.querySelector("[data-f=pct]")!.textContent =
-            `${(bps / 100).toFixed(1)}% to graduation · ${fmt(state.quoteReserve, 18, 5)} / ${fmt(state.migrationQuoteThreshold, 18, 5)} WETH`;
+            `${progressText(state)} to graduation · ${fmt(state.quoteReserve, 18, 5)} / ${fmt(state.migrationQuoteThreshold, 18, 5)} WETH`;
+          card.hidden = false;
         } catch {
-          card.querySelector("[data-f=pct]")!.textContent = "Not an OrbitPad-readable curve";
+          card?.remove();
+        } finally {
+          pending--;
+          updateEmpty();
         }
       }
     };
-    await Promise.all([worker(), worker(), worker()]);
+    await Promise.all([worker(), worker(), worker(), worker()]);
   } catch (error) {
     if (token !== routeToken) return;
     list.innerHTML = `<div class="card"><div class="notice warn">Could not load launches: ${esc(errorMessage(error))}</div></div>`;
@@ -410,7 +445,7 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
     <div class="grid two">
       <div class="grid">
         <div class="card">
-          <div class="inline" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">Graduation progress</h2><strong>${(data.progressBps / 100).toFixed(1)}%</strong></div>
+          <div class="inline" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">Graduation progress</h2><strong>${progressText(state)}</strong></div>
           ${progressBar(data.progressBps)}
           <p class="muted small" style="margin-bottom:0">${fmt(state.quoteReserve, 18, 6)} of ${fmt(state.migrationQuoteThreshold, 18, 6)} WETH raised on the curve.</p>
         </div>
