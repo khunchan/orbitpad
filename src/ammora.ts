@@ -1,6 +1,7 @@
 import {
   AmmoraDataApiClient,
   AmmoraSwapClient,
+  DammV2Client,
   giwaSepoliaAutoRoutePoolProfiles,
   AmmoraV4LaunchCurveClient,
   ammoraLaunchFactoryV4Abi,
@@ -24,7 +25,7 @@ import {
   type AmmoraV4LaunchCurveState,
   type AmmoraV4Segment,
 } from "@ammora-protocol/sdk";
-import { erc20Abi, getAddress, type Address, type Hex } from "viem";
+import { encodeFunctionData, erc20Abi, getAddress, type Address, type Hex } from "viem";
 import {
   DATA_API,
   WETH,
@@ -34,6 +35,7 @@ import {
   launch,
   afterConfirmed,
   balanceOf,
+  nativeBalance,
   deployment,
   freshBlockNumber,
   publicClient,
@@ -605,6 +607,41 @@ export async function claimFees(vault: Address, token: Address, log: Log): Promi
   const tx = buildClaimFeeVaultFor(token, account, account);
   await sendTx({ to: vault, data: tx.data }, "Claim fees", log);
 }
+
+export async function unwrapWeth(amount: bigint, log: Log) {
+  await sendTx({ to: WETH, data: encodeFunctionData({ abi: wethWithdrawAbi, functionName: "withdraw", args: [amount] }) }, "Unwrap WETH", log);
+}
+const wethWithdrawAbi = [{ type: "function", name: "withdraw", stateMutability: "nonpayable", inputs: [{ name: "wad", type: "uint256" }], outputs: [] }] as const;
+
+/** ETH kept aside for gas when wrapping for a buy (approve + swap on GIWA with headroom). */
+export async function gasReserve(): Promise<bigint> {
+  const fees = await publicClient.estimateFeesPerGas();
+  const perGas = fees.maxFeePerGas ?? 1_000_000_000n;
+  const reserve = perGas * 1_500_000n;
+  const floor = 10n ** 14n; // never reserve less than 0.0001 ETH
+  return reserve > floor ? reserve : floor;
+}
+
+/** How much more WETH is needed for `amount`, and whether ETH can cover it plus gas. */
+export async function wrapShortfall(account: Address, amount: bigint) {
+  const [weth, eth, reserve] = await Promise.all([balanceOf(WETH, account), nativeBalance(account), gasReserve()]);
+  const missing = amount > weth ? amount - weth : 0n;
+  return { weth, eth, reserve, missing, canWrap: missing > 0n && eth >= missing + reserve };
+}
+
+// ---------- Graduated pool state ----------
+
+export type PoolView = { price: number; sqrtPrice: bigint; feeBps: number; baseToken: Address; quoteToken: Address };
+
+export async function readPool(pool: Address, baseDecimals: number): Promise<PoolView> {
+  await freshBlockNumber();
+  const client = new DammV2Client(publicClient, pool, "concentrated", launch.concentratedFactory, launch.concentratedPositionManager);
+  const state = await client.getPoolState();
+  return { price: priceFromSqrt(state.sqrtPrice, baseDecimals), sqrtPrice: state.sqrtPrice, feeBps: state.currentFeeBps, baseToken: state.baseToken, quoteToken: state.quoteToken };
+}
+
+/** Raw quote value of a raw base amount at a Q64.64 sqrt price (exact integer math). */
+export const valueAtSqrtPrice = (baseRaw: bigint, sqrtPrice: bigint) => (baseRaw * sqrtPrice * sqrtPrice) >> 128n;
 
 export async function wrapEth(amount: bigint, log: Log) {
   await sendTx({ to: WETH, data: "0xd0e30db0", value: amount }, "Wrap ETH", log);

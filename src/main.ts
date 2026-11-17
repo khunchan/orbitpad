@@ -51,6 +51,11 @@ import {
   executePoolSwap,
   preparePoolSwap,
   quoteToGraduate,
+  gasReserve,
+  readPool,
+  valueAtSqrtPrice,
+  unwrapWeth,
+  wrapShortfall,
   tokenBalance,
   wrapEth,
   type CurveView,
@@ -101,9 +106,9 @@ function errorMessage(error: unknown): string {
 }
 
 /** Log panel bound by id, so lines keep landing in it after the page re-renders mid-flow. */
-function logger(initial: HTMLElement) {
+function logger(initial: HTMLElement, options: { append?: boolean } = {}) {
   const id = initial.id;
-  initial.innerHTML = "";
+  if (!options.append) initial.innerHTML = "";
   initial.classList.add("show");
   const target = () => (id && document.getElementById(id)) || initial;
   const write = (text: string, className?: string) => {
@@ -157,6 +162,44 @@ async function refresh() {
   });
 }
 
+// ---------- Wrap inside Buy ----------
+
+/**
+ * Shows "Wrap X ETH" when the wallet's WETH is below the buy amount (keeping ETH for gas).
+ * Clicking wraps exactly the shortfall and then continues the purchase in the same flow.
+ */
+function wrapForBuy(box: HTMLElement, logId: string, continueBuy: (out: ReturnType<typeof logger>) => Promise<void>) {
+  let seq = 0;
+  return async (amountIn: bigint | null) => {
+    const mine = ++seq;
+    if (!amountIn || amountIn <= 0n || !wallet.account) { box.innerHTML = ""; return; }
+    const need = await wrapShortfall(wallet.account, amountIn);
+    if (mine !== seq) return;
+    if (need.missing === 0n) { box.innerHTML = ""; return; }
+    if (!need.canWrap) {
+      box.innerHTML = `<div class="notice warn">You have ${fmt(need.weth, 18, 6)} WETH and ${fmt(need.eth, 18, 6)} ETH: not enough to wrap ${fmt(need.missing, 18, 6)} ETH and keep ~${fmt(need.reserve, 18, 6)} ETH for gas. <a href="https://faucet.giwa.io/" target="_blank" rel="noopener">Faucet</a></div>`;
+      return;
+    }
+    box.innerHTML = `<div class="notice inline" style="justify-content:space-between">
+      <span>You have ${fmt(need.weth, 18, 6)} WETH. Wrap the missing ${fmt(need.missing, 18, 6)} ETH (keeps ≥${fmt(need.reserve, 18, 6)} ETH for gas), then buy.</span>
+      <button type="button" class="primary" data-wrapbuy>Wrap ${fmt(need.missing, 18, 6)} ETH &amp; buy</button></div>`;
+    box.querySelector<HTMLButtonElement>("[data-wrapbuy]")!.addEventListener("click", async e => {
+      const btn = e.currentTarget as HTMLButtonElement;
+      btn.disabled = true;
+      const out = logger(document.getElementById(logId)!);
+      try {
+        await flow(async () => {
+          await wrapEth(need.missing, out.log);
+          await continueBuy(logger(document.getElementById(logId)!, { append: true }));
+        });
+      } catch (error) {
+        out.error(error);
+        btn.disabled = false;
+      }
+    });
+  };
+}
+
 // ---------- Quick amounts ----------
 
 const quickRow = (id: string) =>
@@ -192,7 +235,19 @@ function shell() {
     </nav>
     <div class="spacer"></div>
     <button class="icon" id="theme" title="Toggle theme" aria-label="Toggle theme">◐</button>
-    <button id="connect" class="primary">Connect</button>
+    <div class="wallet-anchor">
+      <button id="connect" class="primary" aria-haspopup="dialog" aria-expanded="false">Connect</button>
+      <div class="card wallet-panel" id="wallet-panel" role="dialog" aria-label="Wallet" hidden>
+        <div class="inline" style="justify-content:space-between"><strong class="mono" id="wp-addr"></strong>
+          <a class="small" id="wp-explorer" target="_blank" rel="noopener">Explorer ↗</a></div>
+        <dl class="kv" style="margin:12px 0"><dt>ETH</dt><dd id="wp-eth">…</dd><dt>WETH</dt><dd id="wp-weth">…</dd></dl>
+        <div class="field" style="margin-bottom:8px"><label for="wp-amt">Amount</label><input id="wp-amt" inputmode="decimal" placeholder="0.01" />
+          <div class="quick"><button type="button" id="wp-max-eth">Max ETH</button><button type="button" id="wp-max-weth">Max WETH</button></div></div>
+        <div class="inline"><button class="primary" id="wp-wrap" style="flex:1">Wrap ETH → WETH</button><button id="wp-unwrap" style="flex:1">Unwrap WETH → ETH</button></div>
+        <p class="muted small" style="margin:8px 0 0">Max ETH keeps a little ETH for gas.</p>
+        <div class="log" id="wp-log"></div>
+      </div>
+    </div>
   </div></header>
   <main><div class="wrap" id="view"></div></main>
   <footer class="foot"><div class="wrap">
@@ -206,13 +261,76 @@ function shell() {
   document.getElementById("theme")!.addEventListener("click", toggleTheme);
   document.getElementById("connect")!.addEventListener("click", async () => {
     try {
-      if (wallet.account && wallet.chainId !== giwaSepolia.id) await switchNetwork();
+      if (wallet.account && wallet.chainId === giwaSepolia.id) toggleWalletPanel();
+      else if (wallet.account) await switchNetwork();
       else await connect();
     } catch (error) {
       alert(errorMessage(error));
     }
   });
+  bindWalletPanel();
   renderWalletButton();
+}
+
+// ---------- Wallet panel (balances, wrap / unwrap) ----------
+
+const panel = () => document.getElementById("wallet-panel")!;
+let panelBalances = { eth: 0n, weth: 0n };
+
+function toggleWalletPanel(open = panel().hidden) {
+  panel().hidden = !open;
+  document.getElementById("connect")!.setAttribute("aria-expanded", String(open));
+  if (open) void loadWalletPanel();
+}
+
+async function loadWalletPanel() {
+  const account = wallet.account;
+  if (!account || panel().hidden) return;
+  document.getElementById("wp-addr")!.textContent = short(account);
+  document.getElementById("wp-explorer")!.setAttribute("href", addressUrl(account));
+  try {
+    const [eth, weth] = await Promise.all([nativeBalance(account), tokenBalance(WETH, account)]);
+    panelBalances = { eth, weth };
+    document.getElementById("wp-eth")!.textContent = fmt(eth, 18, 6);
+    document.getElementById("wp-weth")!.textContent = fmt(weth, 18, 6);
+  } catch (error) {
+    document.getElementById("wp-eth")!.textContent = errorMessage(error);
+  }
+}
+
+function bindWalletPanel() {
+  const amount = document.getElementById("wp-amt") as HTMLInputElement;
+  document.getElementById("wp-max-eth")!.addEventListener("click", async () => {
+    const reserve = await gasReserve();
+    const max = panelBalances.eth > reserve ? panelBalances.eth - reserve : 0n;
+    amount.value = formatUnits(max, 18);
+  });
+  document.getElementById("wp-max-weth")!.addEventListener("click", () => {
+    amount.value = formatUnits(panelBalances.weth, 18);
+  });
+  const run = (kind: "wrap" | "unwrap") => async (e: Event) => {
+    const btn = e.currentTarget as HTMLButtonElement;
+    const out = logger(document.getElementById("wp-log")!);
+    btn.disabled = true;
+    try {
+      const raw = parseUnits(amount.value.trim() || "0", 18);
+      if (raw <= 0n) throw new Error("Enter an amount");
+      await flow(() => (kind === "wrap" ? wrapEth(raw, out.log) : unwrapWeth(raw, out.log)));
+      amount.value = "";
+    } catch (error) {
+      out.error(error);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  document.getElementById("wp-wrap")!.addEventListener("click", run("wrap"));
+  document.getElementById("wp-unwrap")!.addEventListener("click", run("unwrap"));
+  document.addEventListener("click", e => {
+    const anchor = document.querySelector(".wallet-anchor");
+    if (!panel().hidden && anchor && !anchor.contains(e.target as Node)) toggleWalletPanel(false);
+  });
+  document.addEventListener("keydown", e => { if (e.key === "Escape" && !panel().hidden) toggleWalletPanel(false); });
+  onTxConfirmed(() => void loadWalletPanel());
 }
 
 function toggleTheme() {
@@ -543,6 +661,78 @@ function chartSvg(view: CurveView): string {
   </svg>`;
 }
 
+function curveCards(data: CurveView, status: LaunchStatus, price: number): string {
+  const { state } = data;
+  return `<div class="card chart"><h2>Bonding curve</h2>${chartSvg(data)}
+      <p class="muted small" style="margin-bottom:0">Price (WETH per token) against WETH raised. The dot is the current price.</p></div>
+    <div class="card"><h2>Curve state</h2><dl class="kv">
+      <dt>Status</dt><dd>${esc(status)} (${state.status})</dd>
+      <dt>${state.status === 3 ? "Final curve price" : "Price"}</dt><dd>${price.toPrecision(4)} WETH</dd>
+      <dt>Tokens left on curve</dt><dd>${fmt(state.baseReserve, data.baseDecimals, 2)}</dd>
+      <dt>Current fee</dt><dd>${(state.currentFeeBps / 100).toFixed(2)}%</dd>
+      <dt>Config</dt><dd>#${state.configId}</dd>
+      <dt>Creator</dt><dd><a class="mono" href="${addressUrl(state.creator)}" target="_blank" rel="noopener">${short(state.creator)}</a></dd>
+      <dt>Partner</dt><dd><a class="mono" href="${addressUrl(state.partnerRecipient)}" target="_blank" rel="noopener">${short(state.partnerRecipient)}</a></dd>
+      <dt>As of block</dt><dd>${state.asOfBlock}</dd>
+    </dl></div>`;
+}
+
+function curveLayout(data: CurveView, status: LaunchStatus, price: number): string {
+  const { state } = data;
+  return `<div class="grid two">
+      <div class="grid">
+        <div class="card">
+          <div class="inline" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">Graduation progress</h2><strong>${progressText(state)}</strong></div>
+          ${progressBar(data.progressBps)}
+          <p class="muted small" style="margin-bottom:0">${esc(progressSummary(state))}</p>
+        </div>
+        ${curveCards(data, status, price)}
+        <div class="card"><h2>Creator / Partner split</h2>${splitTable(feeSplit(data.config))}</div>
+      </div>
+      <div class="grid">
+        <div class="card" id="action"></div>
+        <div class="card" id="fees" hidden></div>
+      </div>
+    </div>`;
+}
+
+/** Graduated: pool first, the bonding curve becomes a collapsed history block at the bottom. */
+function graduatedLayout(data: CurveView): string {
+  const { state } = data;
+  return `<div class="grid two">
+      <div class="grid">
+        <div class="card" id="poolcard"><h2>Pool</h2><div class="skeleton" style="width:50%"></div><div class="skeleton" style="margin-top:12px"></div></div>
+        <div class="card"><h2>Creator / Partner split</h2>${splitTable(feeSplit(data.config))}</div>
+      </div>
+      <div class="grid">
+        <div class="card" id="action"></div>
+        <div class="card" id="fees" hidden></div>
+      </div>
+    </div>
+    <details class="card history" style="margin-top:16px">
+      <summary><strong>Curve history</strong> <span class="muted small">· ${esc(progressSummary(state))}</span></summary>
+      <div class="grid two" style="margin-top:14px">${curveCards(data, "Graduated", priceFromSqrt(state.sqrtPrice, data.baseDecimals))}</div>
+    </details>`;
+}
+
+async function renderPoolCard(el: HTMLElement, data: CurveView, token: number) {
+  const { state } = data;
+  const pool = await readPool(state.canonicalPool, data.baseDecimals);
+  const held = wallet.account ? await tokenBalance(state.baseToken, wallet.account) : null;
+  if (token !== routeToken) return;
+  el.innerHTML = `<h2>Pool</h2>
+    <div class="pool-price"><span class="muted small">Price</span><strong>${pool.price.toPrecision(4)} WETH</strong><span class="muted small">per ${esc(data.symbol)}</span></div>
+    <dl class="kv" style="margin-top:12px">
+      <dt>Pool</dt><dd><a class="mono" href="${addressUrl(state.canonicalPool)}" target="_blank" rel="noopener">${short(state.canonicalPool)} ↗</a></dd>
+      <dt>Pool fee</dt><dd>${(pool.feeBps / 100).toFixed(2)}%</dd>
+      ${held === null
+        ? `<dt>Your balance</dt><dd class="muted">connect wallet</dd>`
+        : `<dt>Your balance</dt><dd>${fmt(held, data.baseDecimals, 2)} ${esc(data.symbol)}</dd>
+           <dt>Value at pool price</dt><dd>${fmt(valueAtSqrtPrice(held, pool.sqrtPrice), 18, 8)} WETH</dd>`}
+    </dl>
+    <p class="muted small" style="margin-bottom:0">Value is balance × current pool price, before fees and price impact.</p>`;
+}
+
 async function renderToken(view: HTMLElement, curve: Address, token: number) {
   view.innerHTML = `<div class="card"><div class="skeleton" style="width:40%"></div><div class="skeleton" style="margin-top:14px"></div><div class="skeleton" style="margin-top:14px;width:70%"></div></div>`;
   let data: CurveView;
@@ -580,33 +770,12 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
       </div>
     </div>
     <p class="muted" id="desc" style="margin-top:-6px"></p>
-    <div class="grid two">
-      <div class="grid">
-        <div class="card">
-          <div class="inline" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">Graduation progress</h2><strong>${progressText(state)}</strong></div>
-          ${progressBar(data.progressBps)}
-          <p class="muted small" style="margin-bottom:0">${esc(progressSummary(state))}</p>
-        </div>
-        <div class="card chart"><h2>Bonding curve</h2>${chartSvg(data)}
-          <p class="muted small" style="margin-bottom:0">Price (WETH per token) against WETH raised. The dot is the current price.</p></div>
-        <div class="card"><h2>Curve state</h2><dl class="kv">
-          <dt>Status</dt><dd>${esc(status)} (${state.status})</dd>
-          <dt>Price</dt><dd>${price.toPrecision(4)} WETH</dd>
-          <dt>Tokens left on curve</dt><dd>${fmt(state.baseReserve, data.baseDecimals, 2)}</dd>
-          <dt>Current fee</dt><dd>${(state.currentFeeBps / 100).toFixed(2)}%</dd>
-          <dt>Config</dt><dd>#${state.configId}</dd>
-          <dt>Creator</dt><dd><a class="mono" href="${addressUrl(state.creator)}" target="_blank" rel="noopener">${short(state.creator)}</a></dd>
-          <dt>Partner</dt><dd><a class="mono" href="${addressUrl(state.partnerRecipient)}" target="_blank" rel="noopener">${short(state.partnerRecipient)}</a></dd>
-          <dt>As of block</dt><dd>${state.asOfBlock}</dd>
-        </dl></div>
-        <div class="card"><h2>Creator / Partner split</h2>${splitTable(feeSplit(data.config))}</div>
-      </div>
-      <div class="grid">
-        <div class="card" id="action"></div>
-        <div class="card" id="fees" hidden></div>
-      </div>
-    </div>`;
+    ${state.status === 3 ? graduatedLayout(data) : curveLayout(data, status, price)}`;
 
+  if (state.status === 3) renderPoolCard(view.querySelector<HTMLElement>("#poolcard")!, data, token).catch(error => {
+    const el = view.querySelector<HTMLElement>("#poolcard");
+    if (el) el.innerHTML = `<h2>Pool</h2><div class="notice warn">${esc(errorMessage(error))}</div>`;
+  });
   watchToken(state.baseToken, data.symbol, data.baseDecimals);
   await renderFees(view.querySelector<HTMLElement>("#fees")!, data, token).catch(() => {});
 
@@ -652,6 +821,7 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
     <div class="field"><label for="tslip">Slippage (%)</label><input id="tslip" inputmode="decimal" value="1" /></div>
     <div class="notice" id="quote">Enter an amount for a live quote.</div>
     <div class="muted small" id="tbal" style="margin:10px 0"></div>
+    <div id="wrapbuy" style="margin-bottom:10px"></div>
     <button class="primary" id="trade" style="width:100%">Buy</button>
     <div class="log" id="trade-log"></div>`;
   const amt = action.querySelector<HTMLInputElement>("#amt")!;
@@ -669,7 +839,9 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
   showBal().catch(() => {});
 
   let quoteSeq = 0;
+  let updateWrapRef = () => {};
   const refreshQuote = async () => {
+    updateWrapRef();
     const seq = ++quoteSeq;
     const raw = amt.value.trim();
     if (!raw || Number(raw) <= 0) { quoteEl.className = "notice"; quoteEl.textContent = "Enter an amount for a live quote."; return; }
@@ -713,16 +885,26 @@ async function renderToken(view: HTMLElement, curve: Address, token: number) {
     refreshQuote();
   }));
 
+  const runTrade = async (out: ReturnType<typeof logger>) => {
+    const slip = slippageBps();
+    if (!(slip > 0 && slip < 5000)) throw new Error("Slippage must be between 0 and 50%");
+    const amountIn = parseUnits(amt.value.trim() || "0", inDecimals());
+    if (amountIn <= 0n) throw new Error("Enter an amount");
+    const swap = await flow(() => executeTrade(curve, side, amountIn, slip, out.log));
+    out.log(`Done: swap paid out ${fmt(swap.amountOut, side === "buy" ? data.baseDecimals : 18, 6)} ${side === "buy" ? data.symbol : "WETH"}.`);
+  };
+  const checkWrap = wrapForBuy(action.querySelector<HTMLElement>("#wrapbuy")!, "trade-log", runTrade);
+  updateWrapRef = () => updateWrap();
+  const updateWrap = () => {
+    let amountIn: bigint | null = null;
+    try { amountIn = side === "buy" ? parseUnits(amt.value.trim() || "0", 18) : null; } catch { /* invalid input */ }
+    checkWrap(amountIn).catch(() => {});
+  };
   tradeBtn.addEventListener("click", async () => {
     const out = logger(action.querySelector("#trade-log")!);
-    const slip = slippageBps();
-    if (!(slip > 0 && slip < 5000)) return out.error("Slippage must be between 0 and 50%");
     tradeBtn.disabled = true;
     try {
-      const amountIn = parseUnits(amt.value.trim() || "0", inDecimals());
-      if (amountIn <= 0n) throw new Error("Enter an amount");
-      const swap = await flow(() => executeTrade(curve, side, amountIn, slip, out.log));
-      out.log(`Done: swap paid out ${fmt(swap.amountOut, side === "buy" ? data.baseDecimals : 18, 6)} ${side === "buy" ? data.symbol : "WETH"}.`);
+      await runTrade(out);
     } catch (error) {
       out.error(error);
     } finally {
@@ -743,6 +925,7 @@ function renderPoolTrade(action: HTMLElement, data: CurveView) {
     <div class="field"><label for="pslip">Slippage (%)</label><input id="pslip" inputmode="decimal" value="1" /></div>
     <div class="notice" id="pquote">Enter an amount for a live pool quote.</div>
     <div class="muted small" id="pbal" style="margin:10px 0"></div>
+    <div id="pwrapbuy" style="margin-bottom:10px"></div>
     <button class="primary" id="ptrade" style="width:100%">Buy</button>
     <div class="log" id="ptrade-log"></div>`;
   const amt = action.querySelector<HTMLInputElement>("#pamt")!;
@@ -761,7 +944,9 @@ function renderPoolTrade(action: HTMLElement, data: CurveView) {
   showBal().catch(() => {});
 
   let seq = 0;
+  let updateWrap = () => {};
   const refresh = async () => {
+    updateWrap();
     const mine = ++seq;
     const raw = amt.value.trim();
     if (!raw || Number(raw) <= 0) { quoteEl.className = "notice"; quoteEl.textContent = "Enter an amount for a live pool quote."; return; }
@@ -799,16 +984,25 @@ function renderPoolTrade(action: HTMLElement, data: CurveView) {
     btn.textContent = side === "buy" ? "Buy" : "Sell";
     refresh();
   }));
+  const runSwap = async (out: ReturnType<typeof logger>) => {
+    const slip = slippageBps();
+    if (!(slip > 0 && slip < 5000)) throw new Error("Slippage must be between 0 and 50%");
+    const amountIn = parseUnits(amt.value.trim() || "0", inDecimals());
+    if (amountIn <= 0n) throw new Error("Enter an amount");
+    await flow(() => executePoolSwap(pool, tokenIn(), amountIn, slip, out.log));
+    out.log("Done.");
+  };
+  const checkWrap = wrapForBuy(action.querySelector<HTMLElement>("#pwrapbuy")!, "ptrade-log", runSwap);
+  updateWrap = () => {
+    let amountIn: bigint | null = null;
+    try { amountIn = side === "buy" ? parseUnits(amt.value.trim() || "0", 18) : null; } catch { /* invalid input */ }
+    checkWrap(amountIn).catch(() => {});
+  };
   btn.addEventListener("click", async () => {
     const out = logger(action.querySelector("#ptrade-log")!);
-    const slip = slippageBps();
-    if (!(slip > 0 && slip < 5000)) return out.error("Slippage must be between 0 and 50%");
     btn.disabled = true;
     try {
-      const amountIn = parseUnits(amt.value.trim() || "0", inDecimals());
-      if (amountIn <= 0n) throw new Error("Enter an amount");
-      await flow(() => executePoolSwap(pool, tokenIn(), amountIn, slip, out.log));
-      out.log("Done.");
+      await runSwap(out);
     } catch (error) {
       out.error(error);
     } finally {

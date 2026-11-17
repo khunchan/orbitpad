@@ -179,3 +179,14 @@ footer.foot .links { display: flex; gap: 16px; flex-wrap: wrap; }
 .quick { display: flex; gap: 6px; flex-wrap: wrap; }
 .quick button { padding: 4px 10px; font-size: 12px; border-radius: 999px; background: var(--card-2); }
 .quick button:hover { border-color: var(--teal); }
+
+.pool-price { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.pool-price strong { font-size: 26px; letter-spacing: -0.02em; }
+details.history summary { cursor: pointer; list-style: none; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+details.history summary::before { content: "▸"; color: var(--muted); }
+details.history[open] summary::before { content: "▾"; }
+details.history summary::-webkit-details-marker { display: none; }
+
+.wallet-anchor { position: relative; }
+.wallet-panel { position: absolute; right: 0; top: calc(100% + 10px); width: min(340px, calc(100vw - 32px)); z-index: 20; }
+@media (max-width: 640px) { .wallet-panel { position: fixed; right: 16px; left: 16px; top: 72px; width: auto; } }
