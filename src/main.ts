@@ -25,12 +25,13 @@ import {
   createLaunch,
   claimFees,
   claimableFees,
-  createPlatformConfig,
   curvePoints,
   feeSplit,
   firstBuyContext,
   firstBuyQuote,
-  templateSplit,
+  platformSplit,
+  PlatformConfigUnavailable,
+  ORBITPAD_CONFIG_ID,
   executeTrade,
   findLaunch,
   fmt,
@@ -100,6 +101,13 @@ function isRpcError(error: unknown): boolean {
       || /RPC Request failed|rate limit|Failed to fetch|timed out|429/i.test(e.message ?? "")) return true;
   }
   return false;
+}
+
+/** Why Config #46 economics can't be shown or used right now, in words a visitor can act on. */
+function configErrorMessage(error: unknown): string {
+  if (error instanceof PlatformConfigUnavailable) return `${error.message} Existing tokens keep trading.`;
+  if (isRpcError(error)) return `Couldn't read OrbitPad Config #${ORBITPAD_CONFIG_ID} from GIWA Sepolia (network RPC busy). Reload the page to retry.`;
+  return `Couldn't read OrbitPad Config #${ORBITPAD_CONFIG_ID}: ${errorMessage(error)}`;
 }
 
 function errorMessage(error: unknown): string {
@@ -523,7 +531,7 @@ async function renderLaunch(view: HTMLElement) {
             <dt>Quote asset</dt><dd>WETH</dd>
             <dt>Graduation at</dt><dd>${fmt(THRESHOLD_RAW, 18)} WETH</dd>
             <dt>Sale supply</dt><dd>100,000,000 tokens</dd>
-            <dt>Platform Config</dt><dd id="cfg-dd">${configId === null ? "not created yet" : `#${configId}`}</dd>
+            <dt>Platform Config</dt><dd>#${configId}</dd>
             <dt>Creator</dt><dd>you (the launching wallet)</dd>
             <dt>Partner</dt><dd class="mono">${short(PARTNER)}</dd>
           </dl>
@@ -537,12 +545,11 @@ async function renderLaunch(view: HTMLElement) {
         </div>
         ${isPlatformWallet() ? `<div class="card">
           <h3>Platform Config</h3>
-          <p class="muted small" style="margin-top:0">Launches without a first buy use OrbitPad's shared Config: template #6 fees and split, 0.01 WETH threshold. The platform wallet <code>${short(PARTNER)}</code> owns it and is partner, liquidity partner and leftover receiver. Create it once while connected as that wallet.</p>
-          <div id="cfg-box">${configId === null ? `<button id="mkconfig">Create platform Config</button>` : configChip(configId)}</div>
-          <div class="log" id="config-log"></div>
+          <p class="muted small" style="margin-top:0">OrbitPad's economics live in this shared Config: fees, split, curve and the 0.01 WETH threshold. Launches without a first buy use it directly; launches with a first buy register a copy of it owned by the creator. The platform wallet <code>${short(PARTNER)}</code> owns it and is partner, liquidity partner and leftover receiver.</p>
+          <div>${configChip(configId)}</div>
         </div>` : ""}
         <div class="card">
-          <h3>Creator / Partner split (template #6)</h3>
+          <h3>Creator / Partner split (Config #${configId})</h3>
           <div id="split"><div class="skeleton"></div></div>
           <p class="muted small" style="margin-bottom:0">Protocol fees are fixed by the deployment fee policy. Creators claim their accrued fees on the token page.</p>
         </div>
@@ -573,7 +580,10 @@ async function renderLaunch(view: HTMLElement) {
   ctx.then(({ max }) => {
     firstInput.placeholder = `up to ${fmt(max, 18)}`;
     view.querySelector("#first-hint")!.innerHTML += ` <strong>Max ${fmt(max, 18)} WETH.</strong> The first buy can't fill the curve: reaching the ${fmt(THRESHOLD_RAW, 18)} WETH threshold starts graduation, which must be its own final buy and a separate migrate transaction.`;
-  }).catch(() => {});
+  }).catch(error => {
+    const hint = view.querySelector("#first-hint");
+    if (hint) hint.innerHTML = `<div class="notice warn">First buy unavailable: ${esc(configErrorMessage(error))}</div>`;
+  });
   const showEstimate = async () => {
     const raw = firstInput.value.trim();
     if (!raw || Number(raw) <= 0) { est.textContent = ""; return; }
@@ -586,30 +596,18 @@ async function renderLaunch(view: HTMLElement) {
       const sym = esc(view.querySelector<HTMLInputElement>("#ticker")!.value.trim().toUpperCase() || "tokens");
       est.innerHTML = `≈ ${fmt(q.expectedOut, config.tokenDecimals, 0)} ${sym} · min ${fmt(q.minimum, config.tokenDecimals, 0)} after ${(slip / 100).toFixed(2)}% slippage (fee ${Number(q.feeBps) / 100}%)`;
     } catch (error) {
-      est.textContent = errorMessage(error);
+      est.textContent = configErrorMessage(error);
     }
   };
   firstInput.addEventListener("input", showEstimate);
   slipInputL.addEventListener("input", showEstimate);
 
-  templateSplit().then(rows => {
+  platformSplit().then(rows => {
     const el = view.querySelector("#split");
-    if (el) el.innerHTML = splitTable(rows);
+    if (el) el.innerHTML = rows.length ? splitTable(rows) : `<div class="notice warn">Config #${configId} returned no split data.</div>`;
   }).catch(error => {
     const el = view.querySelector("#split");
-    if (el) el.innerHTML = `<div class="notice warn">${esc(errorMessage(error))}</div>`;
-  });
-
-  view.querySelector("#mkconfig")?.addEventListener("click", async e => {
-    const btn = e.currentTarget as HTMLButtonElement;
-    const out = logger(view.querySelector("#config-log")!);
-    btn.disabled = true;
-    try {
-      const id = await flow(() => createPlatformConfig(out.log));
-      view.querySelector("#cfg-box")!.innerHTML = configChip(id);
-      view.querySelector("#cfg-dd")!.textContent = `#${id}`;
-      out.log(`Saved in this browser. Send this number to make it the site default.`);
-    } catch (error) { out.error(error); btn.disabled = false; }
+    if (el) el.innerHTML = `<div class="notice warn">Split unavailable. ${esc(configErrorMessage(error))}</div>`;
   });
 
   view.querySelector<HTMLFormElement>("#launch-form")!.addEventListener("submit", async e => {
@@ -632,7 +630,7 @@ async function renderLaunch(view: HTMLElement) {
       out.log(`Token ${created.token} on curve ${created.curve}. Opening…`);
       setTimeout(() => (location.hash = `#/t/${created.curve}`), 900);
     } catch (error) {
-      out.error(error);
+      out.error(error instanceof PlatformConfigUnavailable ? configErrorMessage(error) : error);
     } finally {
       btn.disabled = false;
     }

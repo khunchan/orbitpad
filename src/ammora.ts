@@ -14,11 +14,9 @@ import {
   includeAmmoraFee,
   feeVaultAbi,
   getAmmoraV4ConfigAtBlock,
-  parseAmmoraV4ConfigCreatedReceipt,
   parseAmmoraV4LaunchCreatedReceipt,
   parseAmmoraV4MigratedReceipt,
   parseAmmoraV4SwapReceipt,
-  planCreateAmmoraV4Config,
   segmentedExactInput,
   type AmmoraV4Config,
   type AmmoraV4ConfigSnapshot,
@@ -45,31 +43,22 @@ import {
   revokeLeftover,
   sendTx,
 } from "./chain";
-import { deriveConfigFromTemplate } from "./config-from-template";
 
-// GIWA Sepolia reviewed template (Config #6, concentrated graduation).
-export const TEMPLATE_ID = 6n;
-export const TEMPLATE_HASH: Hex = "0x6048908774397e0691bb0e19f72dabb790eb0d892d6081d3622b39e7f738e667";
 /** OrbitPad platform address: platform Config owner, partner, liquidity partner and leftover receiver. */
 export const PARTNER: Address = "0x7dE71b1d5936985182d30336e1AF1Ec399b7178B";
 /** Small graduation threshold so the full lifecycle fits in a couple of testnet buys. */
 export const THRESHOLD_RAW = 10n ** 16n; // 0.01 WETH
 export const SALE_TOKENS = 100_000_000n;
-/** OrbitPad's platform Config #46 (owner/partner = PARTNER, created at block 41534300). */
-export const ORBITPAD_CONFIG_ID: bigint | null = 46n;
+/**
+ * OrbitPad's platform Config #46 (owner/partner = PARTNER, created at block 41534300). It is the single source of
+ * OrbitPad economics: launches without a first buy use it directly, and first-buy launches register a copy of it
+ * (same fees, split, curve and threshold) owned by the creator.
+ */
+export const ORBITPAD_CONFIG_ID = 46n;
+/** Hash of Config #46 as created; a different hash means the ID no longer holds the economics we reviewed. */
+export const ORBITPAD_CONFIG_HASH: Hex = "0xe455d29d4fe6a72ac5e93b4f9de7acbd81f7aaba9be2355720ed2c4623bc3c65";
 
-const CONFIG_KEY = "orbitpad-config-id";
-export function platformConfigId(): bigint | null {
-  if (ORBITPAD_CONFIG_ID !== null) return ORBITPAD_CONFIG_ID;
-  try {
-    const stored = localStorage.getItem(CONFIG_KEY);
-    if (stored && /^\d+$/.test(stored)) return BigInt(stored);
-  } catch { /* storage unavailable */ }
-  return ORBITPAD_CONFIG_ID;
-}
-function rememberConfigId(id: bigint) {
-  try { localStorage.setItem(CONFIG_KEY, id.toString()); } catch { /* ignore */ }
-}
+export const platformConfigId = (): bigint => ORBITPAD_CONFIG_ID;
 
 type Log = (msg: string) => void;
 
@@ -78,43 +67,33 @@ async function latestBlock() {
   return block;
 }
 
-async function templateAt(blockNumber: bigint): Promise<AmmoraV4ConfigSnapshot> {
-  const template = await getAmmoraV4ConfigAtBlock(publicClient, core.configRegistry, TEMPLATE_ID, blockNumber);
-  if (template.configHash.toLowerCase() !== TEMPLATE_HASH.toLowerCase()) throw new Error("Template Config #6 hash changed; refusing to derive");
-  if (!template.enabled) throw new Error("Template Config #6 is disabled");
-  return template;
+/** Thrown when Config #46 is readable but must not be used; the message is shown to users as is. */
+export class PlatformConfigUnavailable extends Error {
+  override name = "PlatformConfigUnavailable";
 }
 
-/** OrbitPad economics: template #6 fees/vesting/LP ratios, 0.01 WETH threshold, partner = platform wallet. */
-export function orbitpadConfig(template: AmmoraV4ConfigSnapshot): { config: AmmoraV4Config; segments: readonly AmmoraV4Segment[] } {
-  const saleSupply = SALE_TOKENS * 10n ** BigInt(template.config.tokenDecimals);
-  const derived = deriveConfigFromTemplate(template, saleSupply, THRESHOLD_RAW);
-  return {
-    config: {
-      ...derived.config,
-      partnerRecipient: PARTNER,
-      leftoverReceiver: PARTNER,
-      liquidityDistribution: { ...derived.config.liquidityDistribution, partner: PARTNER },
-    },
-    segments: derived.curve,
-  };
-}
+const same = (a: Address, b: Address) => a.toLowerCase() === b.toLowerCase();
 
-/** Creates the reusable OrbitPad platform Config, signed by the connected wallet (its owner). */
-export async function createPlatformConfig(log: Log): Promise<bigint> {
-  const { account } = await requireWallet();
-  if (account.toLowerCase() !== PARTNER.toLowerCase()) {
-    throw new Error(`Connect the OrbitPad platform wallet ${PARTNER} to create the platform Config`);
+/** Reads Config #46 at one block and checks it still is OrbitPad's: hash, enabled, platform roles, threshold. */
+export async function platformConfigAt(blockNumber: bigint): Promise<AmmoraV4ConfigSnapshot> {
+  const id = ORBITPAD_CONFIG_ID;
+  const s = await getAmmoraV4ConfigAtBlock(publicClient, core.configRegistry, id, blockNumber);
+  if (s.configHash.toLowerCase() !== ORBITPAD_CONFIG_HASH.toLowerCase()) {
+    throw new PlatformConfigUnavailable(`OrbitPad Config #${id} no longer matches the reviewed economics, so launches are paused.`);
   }
-  const block = await latestBlock();
-  const { config, segments } = orbitpadConfig(await templateAt(block.number));
-  log("Planning platform Config (threshold 0.01 WETH)…");
-  const plan = await planCreateAmmoraV4Config(publicClient, core.configRegistry, config, segments, account, account);
-  const receipt = await sendTx(plan.transaction, "Create Config", log);
-  const created = parseAmmoraV4ConfigCreatedReceipt(receipt, core.configRegistry);
-  rememberConfigId(created.configId);
-  log(`Config #${created.configId} created.`);
-  return created.configId;
+  if (!s.enabled) throw new PlatformConfigUnavailable(`OrbitPad Config #${id} is disabled on-chain, so launches are paused.`);
+  const c = s.config;
+  if (!same(s.identity.owner, PARTNER) || !same(c.partnerRecipient, PARTNER) || !same(c.leftoverReceiver, PARTNER)
+    || !same(c.liquidityDistribution.partner, PARTNER) || !same(c.quoteToken, WETH)
+    || c.migrationQuoteThreshold !== THRESHOLD_RAW || s.segments.length === 0) {
+    throw new PlatformConfigUnavailable(`OrbitPad Config #${id} has unexpected roles or threshold, so launches are paused.`);
+  }
+  return s;
+}
+
+/** OrbitPad economics: Config #46 as registered (fees, split, LP ratios, curve, 0.01 WETH threshold, partner = platform). */
+export function orbitpadConfig(snapshot: AmmoraV4ConfigSnapshot): { config: AmmoraV4Config; segments: readonly AmmoraV4Segment[] } {
+  return { config: snapshot.config, segments: snapshot.segments };
 }
 
 export type LaunchInput = { name: string; symbol: string; description: string; firstBuyRaw: bigint; slippageBps: number };
@@ -165,7 +144,7 @@ export const maxFirstBuyRaw = (config: AmmoraV4Config, segments?: readonly Ammor
 /** OrbitPad first-buy economics at the latest block, for the launch form. */
 export async function firstBuyContext() {
   const blockNumber = await publicClient.getBlockNumber();
-  const { config, segments } = orbitpadConfig(await templateAt(blockNumber));
+  const { config, segments } = orbitpadConfig(await platformConfigAt(blockNumber));
   return { config, segments, max: maxFirstBuyRaw(config, segments) };
 }
 
@@ -174,11 +153,9 @@ export async function createLaunch(input: LaunchInput, log: Log): Promise<{ toke
   const uri = metadataUri(input);
   if (input.firstBuyRaw > 0n) return createWithFirstBuy(account, input, uri, log);
 
-  const configId = platformConfigId();
-  if (configId === null) throw new Error("No OrbitPad platform Config yet. Create it first (see the panel below), or add a first buy.");
+  const configId = ORBITPAD_CONFIG_ID;
   const block = await latestBlock();
-  const snapshot = await getAmmoraV4ConfigAtBlock(publicClient, core.configRegistry, configId, block.number);
-  if (!snapshot.enabled) throw new Error(`Config #${configId} is disabled`);
+  const snapshot = await platformConfigAt(block.number);
   const built = buildCreateAmmoraV4Launch({
     name: input.name,
     symbol: input.symbol,
@@ -198,8 +175,7 @@ async function createWithFirstBuy(account: Address, input: LaunchInput, uri: str
 
   const plan = async () => {
     const block = await latestBlock();
-    const template = await templateAt(block.number);
-    const { config, segments } = orbitpadConfig(template);
+    const { config, segments } = orbitpadConfig(await platformConfigAt(block.number));
     const max = maxFirstBuyRaw(config, segments);
     if (input.firstBuyRaw > max) {
       throw new Error(`First buy can be at most ${fmt(max, 18)} WETH: it may not fill the curve`);
@@ -583,7 +559,7 @@ export async function executePoolSwap(pool: Address, tokenIn: Address, amountIn:
 
 const pct = (bps: number) => `${(bps / 100).toFixed(bps % 100 ? 2 : 0)}%`;
 
-/** Human-readable Creator/Partner economics from a Config (template #6 defaults for OrbitPad). */
+/** Human-readable Creator/Partner economics from a Config. */
 export function feeSplit(config: AmmoraV4Config): Array<[string, string]> {
   const ld = config.liquidityDistribution;
   const creatorLp = 10_000 - ld.partnerUnlockedBps - ld.partnerPermanentLockedBps - ld.creatorPermanentLockedBps;
@@ -598,9 +574,10 @@ export function feeSplit(config: AmmoraV4Config): Array<[string, string]> {
   ];
 }
 
-export async function templateSplit(): Promise<Array<[string, string]>> {
+/** Creator/Partner split of OrbitPad's platform Config #46 at the latest block. */
+export async function platformSplit(): Promise<Array<[string, string]>> {
   const blockNumber = await publicClient.getBlockNumber();
-  return feeSplit((await templateAt(blockNumber)).config);
+  return feeSplit((await platformConfigAt(blockNumber)).config);
 }
 
 async function factoryFeeVault(): Promise<Address> {
