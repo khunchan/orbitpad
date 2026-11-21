@@ -62,9 +62,11 @@ const limitedFetch: typeof fetch = async (input, init) => {
 // viem retries with exponential backoff: delay = 2^attempt × retryDelay (here 400 ms, 800 ms, 1.6 s).
 // Pocket gets no JSON-RPC batches: it answers a one-item batch with a bare object (unparseable as a batch,
 // so every read burned all retries before falling back) and rejects larger batches with HTTP 413.
+// It also has no retries: unbatched, it hits its own rate limit (429) under list load, and backing off on
+// it only delays the fallback to GIWA's RPCs, which then take the request at once.
 const rpc = (url: string) => http(url, {
   batch: url === POCKET_RPC_URL ? false : { batchSize: 10, wait: 16 },
-  retryCount: 3,
+  retryCount: url === POCKET_RPC_URL ? 0 : 3,
   retryDelay: 400,
   timeout: 15_000,
   fetchFn: limitedFetch,
@@ -73,6 +75,15 @@ const rpc = (url: string) => http(url, {
 export const publicClient = createPublicClient({
   chain: giwaSepolia,
   transport: fallback(SITE_RPC_URLS.map(rpc), { retryCount: 1, retryDelay: 500 }),
+});
+
+/**
+ * Event-log queries go to GIWA's own RPCs only: Pocket's eth_getLogs randomly omits events (the same
+ * 10k-block window returned 3 LaunchCreated logs on GIWA RPC and 0 on Pocket), so launches went missing.
+ */
+export const logsClient = createPublicClient({
+  chain: giwaSepolia,
+  transport: fallback([FLASHBLOCKS_RPC_URL, RPC_URL].map(rpc), { retryCount: 1, retryDelay: 500 }),
 });
 
 export const core = {

@@ -40,6 +40,7 @@ import {
   deployment,
   freshBlockNumber,
   publicClient,
+  logsClient,
   requireWallet,
   revokeLeftover,
   sendTx,
@@ -250,10 +251,21 @@ const STATUS_FROM_API: Record<string, LaunchStatus> = {
 export const statusLabel = (status: number): LaunchStatus =>
   status === 1 ? "Trading" : status === 2 ? "Ready to migrate" : status === 3 ? "Graduated" : "Pending";
 
+/** Data API failures are remembered briefly, so re-rendering the list doesn't wait out its timeout again. */
+let dataApiDownUntil = 0;
+const DATA_API_TIMEOUT_MS = 6_000;
+const DATA_API_DOWN_MS = 120_000;
+/** If the Data API hasn't answered by then, the RPC log scan starts alongside it instead of after its timeout. */
+const LOG_SCAN_HEAD_START_MS = 1_500;
+
 export async function recentLaunches(limit = 24): Promise<{ rows: LaunchRow[]; source: "api" | "rpc"; apiStatus?: Record<string, LaunchStatus> }> {
+  if (Date.now() < dataApiDownUntil) return { rows: await launchesFromLogs(limit), source: "rpc" };
+  let logs: Promise<LaunchRow[]> | undefined;
+  const startLogs = () => (logs ??= launchesFromLogs(limit));
+  const headStart = setTimeout(() => void startLogs().catch(() => {}), LOG_SCAN_HEAD_START_MS);
   try {
     const api = new AmmoraDataApiClient(DATA_API);
-    const page = await api.getLaunches({ chainId: BigInt(giwaSepolia.id), signal: AbortSignal.timeout(6000) });
+    const page = await api.getLaunches({ chainId: BigInt(giwaSepolia.id), signal: AbortSignal.timeout(DATA_API_TIMEOUT_MS) });
     const items = page.items.filter(item => item.protocolVersion === 4).slice(0, limit);
     const apiStatus: Record<string, LaunchStatus> = {};
     const rows = items.map(item => {
@@ -266,7 +278,10 @@ export async function recentLaunches(limit = 24): Promise<{ rows: LaunchRow[]; s
     rows.sort((a, b) => Number(b.block - a.block));
     return { rows, source: "api", apiStatus };
   } catch {
-    return { rows: await launchesFromLogs(limit), source: "rpc" };
+    dataApiDownUntil = Date.now() + DATA_API_DOWN_MS;
+    return { rows: await startLogs(), source: "rpc" };
+  } finally {
+    clearTimeout(headStart);
   }
 }
 
@@ -277,12 +292,12 @@ const launchCreatedEvent = ammoraLaunchFactoryV4Abi.find(
 
 /** Fallback: scan LaunchCreated on the V4 factory backwards in fixed windows. */
 export async function launchesFromLogs(limit: number, windows = 12, span = 10_000n): Promise<LaunchRow[]> {
-  const head = await publicClient.getBlockNumber();
+  const head = await logsClient.getBlockNumber();
   const rows: LaunchRow[] = [];
   let to = head;
   for (let i = 0; i < windows && rows.length < limit && to > deploymentStart; i++) {
     const from = to - span + 1n > deploymentStart ? to - span + 1n : deploymentStart;
-    const logs = await publicClient.getLogs({ address: core.launchFactory, event: launchCreatedEvent, fromBlock: from, toBlock: to });
+    const logs = await logsClient.getLogs({ address: core.launchFactory, event: launchCreatedEvent, fromBlock: from, toBlock: to });
     for (const log of logs.reverse()) {
       rows.push({
         token: log.args.token!, curve: log.args.curve!, creator: log.args.creator!, configId: log.args.configId!,
@@ -297,7 +312,7 @@ const deploymentStart = 36_220_000n;
 
 /** Finds the LaunchCreated log for one curve (metadata/description lookup). */
 export async function findLaunch(curve: Address, creationHint?: bigint): Promise<LaunchRow | null> {
-  const head = await publicClient.getBlockNumber();
+  const head = await logsClient.getBlockNumber();
   const ranges: Array<[bigint, bigint]> = [];
   if (creationHint) ranges.push([creationHint, creationHint]);
   for (let to = head, i = 0; i < 30 && to > deploymentStart; i++) {
@@ -306,7 +321,7 @@ export async function findLaunch(curve: Address, creationHint?: bigint): Promise
     to = from - 1n;
   }
   for (const [fromBlock, toBlock] of ranges) {
-    const logs = await publicClient.getLogs({ address: core.launchFactory, event: launchCreatedEvent, args: { curve }, fromBlock, toBlock });
+    const logs = await logsClient.getLogs({ address: core.launchFactory, event: launchCreatedEvent, args: { curve }, fromBlock, toBlock });
     const log = logs[0];
     if (log) {
       return { token: log.args.token!, curve, creator: log.args.creator!, configId: log.args.configId!, metadataURI: log.args.metadataURI ?? "", block: log.blockNumber, source: "rpc" };
