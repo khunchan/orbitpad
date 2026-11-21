@@ -517,7 +517,7 @@ async function renderLaunch(view: HTMLElement) {
         <div class="field"><label for="first">First buy (WETH, optional)</label>
           <input id="first" inputmode="decimal" placeholder="0.002" />
           <span class="muted small" id="first-est"></span>
-          <span class="muted small" id="first-hint">With a first buy, a new OrbitPad Config, your token and the first buy are created atomically in one transaction (after an exact WETH approval).</span>
+          <span class="muted small" id="first-hint">With a first buy, a new OrbitPad Config, your token and the first buy are created atomically in one transaction (after an exact WETH approval). <span id="first-max"></span></span>
         </div>
         <div class="field"><label for="slip">Slippage for first buy (%)</label><input id="slip" inputmode="decimal" value="5" /></div>
         <button class="primary" type="submit" style="width:100%">Launch</button>
@@ -579,10 +579,11 @@ async function renderLaunch(view: HTMLElement) {
   const ctx = firstBuyContext();
   ctx.then(({ max }) => {
     firstInput.placeholder = `up to ${fmt(max, 18)}`;
-    view.querySelector("#first-hint")!.innerHTML += ` <strong>Max ${fmt(max, 18)} WETH.</strong> The first buy can't fill the curve: reaching the ${fmt(THRESHOLD_RAW, 18)} WETH threshold starts graduation, which must be its own final buy and a separate migrate transaction.`;
+    const maxEl = view.querySelector("#first-max");
+    if (maxEl) maxEl.innerHTML = `<strong>Max ${fmt(max, 18)} WETH.</strong> The first buy can't fill the curve: reaching the ${fmt(THRESHOLD_RAW, 18)} WETH threshold starts graduation, which must be its own final buy and a separate migrate transaction.`;
   }).catch(error => {
-    const hint = view.querySelector("#first-hint");
-    if (hint) hint.innerHTML = `<div class="notice warn">First buy unavailable: ${esc(configErrorMessage(error))}</div>`;
+    const maxEl = view.querySelector("#first-max");
+    if (maxEl) maxEl.innerHTML = `<span class="notice warn" style="display:block">First buy unavailable: ${esc(configErrorMessage(error))}</span>`;
   });
   const showEstimate = async () => {
     const raw = firstInput.value.trim();

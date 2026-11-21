@@ -60,8 +60,10 @@ const limitedFetch: typeof fetch = async (input, init) => {
 };
 
 // viem retries with exponential backoff: delay = 2^attempt × retryDelay (here 400 ms, 800 ms, 1.6 s).
+// Pocket gets no JSON-RPC batches: it answers a one-item batch with a bare object (unparseable as a batch,
+// so every read burned all retries before falling back) and rejects larger batches with HTTP 413.
 const rpc = (url: string) => http(url, {
-  batch: { batchSize: 10, wait: 16 },
+  batch: url === POCKET_RPC_URL ? false : { batchSize: 10, wait: 16 },
   retryCount: 3,
   retryDelay: 400,
   timeout: 15_000,
@@ -177,6 +179,13 @@ export async function backgroundGate(): Promise<void> {
   while (walletPrompts > 0 || (typeof document !== "undefined" && document.hidden)) {
     await new Promise<void>(resolve => resumeWaiters.push(resolve));
   }
+}
+
+/** Rejects with `message` if `promise` hasn't settled after `ms`; the underlying work is abandoned, not cancelled. */
+export function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /** Marks a wallet interaction (simulate → sign → receipt); background reads pause until it ends. */
@@ -300,11 +309,15 @@ export async function sendTx(tx: Tx, label: string, log: (msg: string) => void):
 async function signAndWait(tx: Tx, label: string, log: (msg: string) => void): Promise<TransactionReceipt> {
   const { client, account } = await requireWallet();
   log(`${label}: simulating…`);
-  await publicClient.call({ account, to: tx.to, data: tx.data, value: tx.value });
+  await withTimeout(publicClient.call({ account, to: tx.to, data: tx.data, value: tx.value }), 60_000,
+    `${label}: simulation got no answer from the network RPC in 60 s. Nothing was sent; try again.`);
   log(`${label}: confirm in your wallet…`);
   const hash = await client.sendTransaction({ account, chain: giwaSepolia, to: tx.to, data: tx.data, value: tx.value });
   log(`${label}: submitted ${short(hash)}, waiting for receipt…`);
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 180_000 }).catch(error => {
+    if ((error as Error)?.name !== "WaitForTransactionReceiptTimeoutError") throw error;
+    throw new Error(`${label}: no receipt after 3 min. It may still confirm: check ${EXPLORER}/tx/${hash} before retrying.`);
+  });
   if (receipt.status !== "success") throw new Error(`${label} reverted (${hash})`);
   log(`${label}: confirmed in block ${receipt.blockNumber}`);
   return receipt;

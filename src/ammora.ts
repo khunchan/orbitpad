@@ -35,6 +35,7 @@ import {
   backgroundGate,
   balanceOf,
   withWalletPrompt,
+  withTimeout,
   nativeBalance,
   deployment,
   freshBlockNumber,
@@ -154,8 +155,9 @@ export async function createLaunch(input: LaunchInput, log: Log): Promise<{ toke
   if (input.firstBuyRaw > 0n) return createWithFirstBuy(account, input, uri, log);
 
   const configId = ORBITPAD_CONFIG_ID;
-  const block = await latestBlock();
-  const snapshot = await platformConfigAt(block.number);
+  log(`Reading OrbitPad Config #${configId}…`);
+  const block = await step(latestBlock(), "Reading the latest block");
+  const snapshot = await step(platformConfigAt(block.number), `Reading Config #${configId}`);
   const built = buildCreateAmmoraV4Launch({
     name: input.name,
     symbol: input.symbol,
@@ -168,14 +170,23 @@ export async function createLaunch(input: LaunchInput, log: Log): Promise<{ toke
   return { token: created.token, curve: created.curve };
 }
 
+const STEP_TIMEOUT_MS = 30_000;
+const PLAN_TIMEOUT_MS = 90_000;
+/** One network step of a launch: fails with a clear message instead of leaving the button busy forever. */
+const step = <T>(promise: Promise<T>, what: string, ms = STEP_TIMEOUT_MS) =>
+  withTimeout(promise, ms, `${what} got no answer in ${ms / 1000} s: the network RPC is slow or rate-limited. Nothing was sent; try again in a minute.`);
+
 /** Atomic path: approval (if needed) → replan at a fresh block → READY → one Config+token+first-buy transaction. */
 async function createWithFirstBuy(account: Address, input: LaunchInput, uri: string, log: Log) {
-  const wethBalance = await publicClient.readContract({ address: WETH, abi: erc20Abi, functionName: "balanceOf", args: [account] });
+  log("Checking your WETH balance…");
+  const wethBalance = await step(publicClient.readContract({ address: WETH, abi: erc20Abi, functionName: "balanceOf", args: [account] }), "Reading your WETH balance");
   if (wethBalance < input.firstBuyRaw) throw new Error("Not enough WETH. Use “Wrap ETH → WETH” first.");
 
   const plan = async () => {
-    const block = await latestBlock();
-    const { config, segments } = orbitpadConfig(await platformConfigAt(block.number));
+    log("Reading the latest block…");
+    const block = await step(latestBlock(), "Reading the latest block");
+    log(`Reading OrbitPad Config #${ORBITPAD_CONFIG_ID} at block ${block.number}…`);
+    const { config, segments } = orbitpadConfig(await step(platformConfigAt(block.number), `Reading Config #${ORBITPAD_CONFIG_ID}`));
     const max = maxFirstBuyRaw(config, segments);
     if (input.firstBuyRaw > max) {
       throw new Error(`First buy can be at most ${fmt(max, 18)} WETH: it may not fill the curve`);
@@ -185,8 +196,10 @@ async function createWithFirstBuy(account: Address, input: LaunchInput, uri: str
     if (q.amountLeft > 0n) throw new Error("First buy would fill the curve; use a smaller amount");
     if (q.minimum <= 0n) throw new Error("First buy too small to receive tokens");
     const minimum = q.minimum;
-    const fees = await publicClient.estimateFeesPerGas();
-    return createConfigAndPoolWithFirstBuy(publicClient, {
+    log("Reading gas price…");
+    const fees = await step(publicClient.estimateFeesPerGas(), "Reading gas price");
+    log("Planning with the Ammora SDK (verifies contracts, allowance and gas at this block)…");
+    return step(createConfigAndPoolWithFirstBuy(publicClient, {
       account,
       config,
       segments,
@@ -195,11 +208,12 @@ async function createWithFirstBuy(account: Address, input: LaunchInput, uri: str
       deadline: block.timestamp + 1800n,
       gas: { maxFeePerGasNativeRaw: (fees.maxFeePerGas ?? 1_000_000_000n) * 2n, safetyMarginBps: 2_000n },
       blockNumber: block.number,
-    });
+    }), "Planning the launch transaction", PLAN_TIMEOUT_MS);
   };
 
   log("Previewing atomic Config + launch + first buy…");
   let result = await plan();
+  log(result.status === "APPROVAL_REQUIRED" ? `Plan: an exact WETH approval is needed first.` : `Plan: ${result.status}.`);
   if (result.status === "APPROVAL_REQUIRED") {
     if (result.transaction.to.toLowerCase() !== WETH.toLowerCase()) throw new Error("Unexpected approval target");
     await sendTx(result.transaction, `Approve ${fmt(result.totalQuoteAmountRaw, 18)} WETH`, log);
