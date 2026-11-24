@@ -114,6 +114,8 @@ main { padding: 28px 0 48px; }
 .launch-card .row1 { display: flex; gap: 12px; align-items: center; min-width: 0; }
 .launch-card .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #list[data-filter="orbitpad"] .launch-card:not(.ours) { display: none; }
+#list[data-filter="all"] .launch-card:not([data-in-all]) { display: none; }
+#list[data-filter="all"] [data-scope="orbitpad"], #list[data-filter="orbitpad"] [data-scope="all"] { display: none; }
 #list .launch-card.ours { order: -1; }
 .loading-card { pointer-events: none; }
 .pixel { border-radius: 12px; flex: none; image-rendering: pixelated; }

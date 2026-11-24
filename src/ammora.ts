@@ -105,7 +105,7 @@ export function metadataUri(input: { name: string; symbol: string; description: 
   return `data:application/json;base64,${btoa(unescape(encodeURIComponent(json)))}`;
 }
 
-export function parseMetadata(uri: string): { description?: string } {
+export function parseMetadata(uri: string): { description?: string; app?: string } {
   try {
     if (uri.startsWith("data:application/json;base64,")) {
       return JSON.parse(decodeURIComponent(escape(atob(uri.slice(29)))));
@@ -330,6 +330,100 @@ export async function findLaunch(curve: Address, creationHint?: bigint): Promise
   return null;
 }
 
+// ---------- OrbitPad launches since Config #46 (cached in the browser) ----------
+
+/** Block that created Config #46: no OrbitPad launch can be older. */
+export const ORBITPAD_START_BLOCK = 41_534_300n;
+/** GIWA RPC rejects eth_getLogs ranges over 10,000 blocks ("block range greater than 10000 max"). */
+const GIWA_LOG_SPAN = 10_000n;
+/** Windows fetched at once (the transport batches them; the global limiter still caps requests in flight). */
+const LOG_WINDOWS_PER_STEP = 4;
+/** The newest blocks are rescanned on the next visit, in case the chain head reorganises. */
+const REORG_MARGIN = 64n;
+const OURS_KEY = `orbitpad-ours:v1:${core.launchFactory.toLowerCase()}`;
+/** Scanned block interval [from, to] and the OrbitPad launches found in it. */
+type OursCache = { from: bigint; to: bigint; rows: LaunchRow[] };
+
+/**
+ * Candidate OrbitPad launch from its LaunchCreated log alone: on Config #46, or created by this site (its
+ * metadata says app "OrbitPad"). The list still confirms each with the curve state (isOrbitPadLaunch).
+ */
+const isOurRow = (r: LaunchRow) => r.configId === ORBITPAD_CONFIG_ID || parseMetadata(r.metadataURI).app === "OrbitPad";
+
+function loadOurs(): OursCache | null {
+  try {
+    const stored = localStorage.getItem(OURS_KEY);
+    return stored ? fromJson<OursCache>(stored) : null;
+  } catch { return null; }
+}
+function saveOurs(cache: OursCache) {
+  try { localStorage.setItem(OURS_KEY, toJson(cache)); } catch { /* storage full or unavailable */ }
+}
+const newestFirst = (rows: Iterable<LaunchRow>) => [...rows].sort((a, b) => Number(b.block - a.block));
+
+/** OrbitPad launches already cached in this browser, newest first (instant, no RPC). */
+export const cachedOurLaunches = (): LaunchRow[] => newestFirst(loadOurs()?.rows ?? []);
+
+async function launchLogs(fromBlock: bigint, toBlock: bigint): Promise<LaunchRow[]> {
+  const logs = await logsClient.getLogs({ address: core.launchFactory, event: launchCreatedEvent, fromBlock, toBlock });
+  return logs.map(log => ({
+    token: log.args.token!, curve: log.args.curve!, creator: log.args.creator!, configId: log.args.configId!,
+    metadataURI: log.args.metadataURI ?? "", block: log.blockNumber, source: "rpc" as const,
+  }));
+}
+
+export type OursProgress = { rows: LaunchRow[]; scannedFrom: bigint; head: bigint; done: boolean };
+
+/**
+ * Brings the cached OrbitPad launch list up to date: first the blocks after the cached range, then any history
+ * between ORBITPAD_START_BLOCK and the cached range, newest first, in 10k-block windows. Progress is saved after
+ * every step, so an interrupted scan resumes where it stopped. `onProgress` gets the full list after each step.
+ */
+export async function syncOurLaunches(onProgress: (p: OursProgress) => void, keepGoing: () => boolean = () => true): Promise<OursProgress> {
+  const head = await logsClient.getBlockNumber();
+  const safeHead = head > REORG_MARGIN ? head - REORG_MARGIN : head;
+  const stored = loadOurs();
+  const cache: OursCache = stored && stored.from >= ORBITPAD_START_BLOCK && stored.from <= stored.to + 1n
+    ? stored
+    : { from: safeHead + 1n, to: safeHead, rows: [] };
+  const byCurve = new Map(cache.rows.map(r => [r.curve.toLowerCase(), r]));
+  const progress = (): OursProgress => ({ rows: newestFirst(byCurve.values()), scannedFrom: cache.from, head, done: cache.from <= ORBITPAD_START_BLOCK });
+  const step = async (windows: Array<[bigint, bigint]>) => {
+    const found = await Promise.all(windows.map(([from, to]) => launchLogs(from, to)));
+    for (const r of found.flat()) if (isOurRow(r)) byCurve.set(r.curve.toLowerCase(), r);
+  };
+  const save = () => { cache.rows = newestFirst(byCurve.values()); saveOurs(cache); onProgress(progress()); };
+
+  // 1. New blocks since the last visit, oldest window first so `to` only ever advances over scanned blocks.
+  let next = cache.to + 1n;
+  while (next <= head && keepGoing()) {
+    const windows: Array<[bigint, bigint]> = [];
+    for (let i = 0; i < LOG_WINDOWS_PER_STEP && next <= head; i++) {
+      const end = next + GIWA_LOG_SPAN - 1n < head ? next + GIWA_LOG_SPAN - 1n : head;
+      windows.push([next, end]);
+      next = end + 1n;
+    }
+    await step(windows);
+    const end = windows[windows.length - 1]![1];
+    cache.to = end < safeHead ? end : safeHead > cache.to ? safeHead : cache.to;
+    save();
+  }
+  // 2. Older history down to Config #46's block, newest window first.
+  while (cache.from > ORBITPAD_START_BLOCK && keepGoing()) {
+    const windows: Array<[bigint, bigint]> = [];
+    let end = cache.from - 1n;
+    for (let i = 0; i < LOG_WINDOWS_PER_STEP && end >= ORBITPAD_START_BLOCK; i++) {
+      const start = end - GIWA_LOG_SPAN + 1n > ORBITPAD_START_BLOCK ? end - GIWA_LOG_SPAN + 1n : ORBITPAD_START_BLOCK;
+      windows.push([start, end]);
+      end = start - 1n;
+    }
+    await step(windows);
+    cache.from = windows[windows.length - 1]![0];
+    save();
+  }
+  return progress();
+}
+
 // ---------- Curve ----------
 
 export const curveClient = (curve: Address) => new AmmoraV4LaunchCurveClient(publicClient, curve, core);
@@ -420,6 +514,17 @@ const ROW_TTL_MS = 30_000;
 const rowStates = new Map<string, { state: AmmoraV4LaunchCurveState; at: number }>();
 const tokenNames = new Map<string, { name: string; symbol: string }>();
 
+const ROW_KEY = "orbitpad-row:";
+type RowSnapshot = { state: AmmoraV4LaunchCurveState; name: string; symbol: string; at: number };
+
+/** Last list status read for a curve in this browser, shown at once while the live read runs. */
+export function cachedRowState(curve: Address): RowSnapshot | null {
+  try {
+    const stored = localStorage.getItem(ROW_KEY + curve.toLowerCase());
+    return stored ? fromJson<RowSnapshot>(stored) : null;
+  } catch { return null; }
+}
+
 /** Lightweight list status: state (cached 30 s, waits for the background gate) + token name (cached). */
 export async function readRowState(curve: Address, maxAgeMs = ROW_TTL_MS): Promise<{ state: AmmoraV4LaunchCurveState; name: string; symbol: string }> {
   const key = curve.toLowerCase();
@@ -439,6 +544,7 @@ export async function readRowState(curve: Address, maxAgeMs = ROW_TTL_MS): Promi
     names = { name, symbol };
     tokenNames.set(state.baseToken.toLowerCase(), names);
   }
+  try { localStorage.setItem(ROW_KEY + key, toJson({ state, ...names, at: entry.at })); } catch { /* ignore */ }
   return { state, ...names };
 }
 

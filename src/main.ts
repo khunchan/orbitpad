@@ -1,5 +1,6 @@
 import "./style.css";
 import { formatUnits, isAddress, parseEther, parseUnits, getAddress, type Address } from "viem";
+import type { AmmoraV4LaunchCurveState } from "@ammora-protocol/sdk";
 import {
   addressUrl,
   connect,
@@ -44,6 +45,11 @@ import {
   readCurve,
   readRowState,
   recentLaunches,
+  cachedOurLaunches,
+  cachedRowState,
+  syncOurLaunches,
+  ORBITPAD_START_BLOCK,
+  type LaunchRow,
   statusLabel,
   progressOf,
   progressText,
@@ -414,11 +420,25 @@ async function renderHome(view: HTMLElement, token: number) {
     <div class="card muted" id="empty" hidden></div>`;
   const list = view.querySelector<HTMLElement>("#list")!;
   const empty = view.querySelector<HTMLElement>("#empty")!;
-  let pending = 0;
+  const src = view.querySelector<HTMLElement>("#src")!;
+  const current = () => token === routeToken;
 
+  // One grid for both tabs. OrbitPad tab: every launch since Config #46 (cached scan, .ours after the state
+  // read confirms it). All tab: the recent window only (cards marked data-in-all).
+  const cards = new Map<string, HTMLElement>();
+  const dropped = new Set<string>();
+  const fillQueue: Array<{ row: LaunchRow; card: HTMLElement }> = [];
+  let workers = 0;
+  let oursLoading = true;
+  let allLoading = true;
+  let oursStatus = "";
+  let allStatus = "";
+
+  const showStatus = () => { src.textContent = listFilter === "orbitpad" ? oursStatus : allStatus; };
   const updateEmpty = () => {
-    const visible = list.querySelectorAll(listFilter === "orbitpad" ? ".launch-card.ready-row.ours" : ".launch-card.ready-row").length;
-    const loading = pending > 0;
+    const visible = list.querySelectorAll(listFilter === "orbitpad" ? ".launch-card.ready-row.ours" : ".launch-card.ready-row[data-in-all]").length;
+    const loading = (listFilter === "orbitpad" ? oursLoading : allLoading) || workers > 0 || fillQueue.length > 0;
+    if (visible > 0 || !loading) list.querySelectorAll(".loading-card").forEach(el => el.remove());
     empty.hidden = visible > 0 || loading;
     empty.innerHTML = listFilter === "orbitpad"
       ? `No OrbitPad launches yet. <a href="#/launch">Launch the first one</a>.`
@@ -428,15 +448,74 @@ async function renderHome(view: HTMLElement, token: number) {
     listFilter = b.dataset.filter as ListFilter;
     list.dataset.filter = listFilter;
     view.querySelectorAll("[data-filter] ").forEach(x => x.classList.toggle("on", x === b));
+    showStatus();
     updateEmpty();
   }));
 
-  try {
-    const { rows, source } = await recentLaunches(40);
-    if (token !== routeToken) return;
-    view.querySelector("#src")!.textContent = source === "api" ? "via Ammora Data API" : "via on-chain events";
-    list.innerHTML = rows.map(r => `
-      <a class="card launch-card" href="#/t/${r.curve}" data-curve="${r.curve}" hidden>
+  const paint = (card: HTMLElement, state: AmmoraV4LaunchCurveState, name: string, symbol: string) => {
+    const ours = isOrbitPadLaunch(state);
+    card.classList.add("ready-row");
+    card.classList.toggle("ours", ours);
+    card.querySelector("[data-f=name]")!.textContent = name;
+    card.querySelector("[data-f=sym]")!.textContent = `$${symbol}${ours ? "" : ` · Config #${state.configId}`}`;
+    card.querySelector("[data-f=status]")!.innerHTML = statusPill(statusLabel(state.status));
+    card.querySelector("[data-f=bar]")!.innerHTML = progressBar(progressOf(state));
+    card.querySelector("[data-f=pct]")!.textContent = progressSummary(state);
+    card.hidden = false;
+  };
+  const fill = async (r: LaunchRow, card: HTMLElement) => {
+    const { state, name, symbol } = await readRowState(r.curve);
+    if (current()) paint(card, state, name, symbol);
+  };
+  const showRetry = (r: LaunchRow, card: HTMLElement) => {
+    if (card.classList.contains("ready-row") && card.querySelector("[data-f=status]")!.innerHTML) return; // keep the cached status
+    card.classList.add("ready-row");
+    card.classList.toggle("ours", r.configId === platformConfigId());
+    card.querySelector("[data-f=name]")!.textContent = short(r.token);
+    card.querySelector("[data-f=sym]")!.textContent = `Config #${r.configId}`;
+    card.querySelector("[data-f=pct]")!.innerHTML = `RPC busy — <button type="button" class="icon small" data-retry>Retry</button>`;
+    card.hidden = false;
+    card.querySelector("[data-retry]")!.addEventListener("click", async e => {
+      e.preventDefault();
+      e.stopPropagation();
+      card.querySelector("[data-f=pct]")!.textContent = "Loading…";
+      try { await fill(r, card); } catch (error) { if (isRpcError(error)) showRetry(r, card); else dropCard(r); }
+    });
+  };
+  const dropCard = (r: LaunchRow) => {
+    const key = r.curve.toLowerCase();
+    dropped.add(key);
+    cards.get(key)?.remove();
+    cards.delete(key);
+  };
+  // Live status reads, two at a time; OrbitPad cards are queued first.
+  const pump = () => {
+    while (workers < 2 && fillQueue.length) {
+      workers++;
+      void (async () => {
+        for (let job = fillQueue.shift(); job && current(); job = fillQueue.shift()) {
+          try {
+            await fill(job.row, job.card);
+          } catch (error) {
+            // Unreadable curves (other generations/launchpads) are dropped; transient RPC failures get a Retry.
+            if (isRpcError(error)) showRetry(job.row, job.card); else dropCard(job.row);
+          }
+          updateEmpty();
+        }
+        workers--;
+        updateEmpty();
+      })();
+    }
+  };
+  /** Adds a card (newest launch first), paints it from this browser's cache if possible and queues a live read. */
+  const addRow = (r: LaunchRow, inAll: boolean, priority: boolean) => {
+    const key = r.curve.toLowerCase();
+    if (dropped.has(key)) return;
+    let card = cards.get(key);
+    if (!card) {
+      const tpl = document.createElement("template");
+      tpl.innerHTML = `
+      <a class="card launch-card" href="#/t/${r.curve}" data-curve="${r.curve}" data-block="${r.block}" hidden>
         <div class="row1">${pixelAvatar(r.token, 44)}
           <div style="min-width:0;flex:1"><div class="name" data-f="name"></div>
           <div class="muted small" data-f="sym"></div></div>
@@ -444,60 +523,65 @@ async function renderHome(view: HTMLElement, token: number) {
         </div>
         <div data-f="bar"></div>
         <div class="muted small" data-f="pct"></div>
-      </a>`).join("");
-    pending = rows.length;
+      </a>`.trim();
+      card = tpl.content.firstElementChild as HTMLElement;
+      const after = [...cards.values()].find(c => BigInt(c.dataset.block!) < r.block);
+      list.insertBefore(card, after ?? null);
+      cards.set(key, card);
+      const cached = cachedRowState(r.curve);
+      if (cached) paint(card, cached.state, cached.name, cached.symbol);
+      const job = { row: r, card };
+      if (priority) fillQueue.unshift(job); else fillQueue.push(job);
+      pump();
+    }
+    if (inAll) card.dataset.inAll = "1";
+  };
+
+  // 1. OrbitPad launches: cached rows at once, then new blocks and any missing history.
+  const cachedOurs = cachedOurLaunches();
+  cachedOurs.forEach(r => addRow(r, false, false));
+  oursStatus = cachedOurs.length ? "OrbitPad launches · updating…" : "OrbitPad launches · scanning since Config #46…";
+  showStatus();
+  updateEmpty();
+  const ours = syncOurLaunches(p => {
+    if (!current()) return;
+    p.rows.forEach(r => addRow(r, false, true));
+    if (!p.done) {
+      const pct = Number((p.head - p.scannedFrom) * 100n / (p.head - ORBITPAD_START_BLOCK));
+      oursStatus = `OrbitPad launches · scanning history ${Math.min(99, Math.max(0, pct))}%…`;
+      showStatus();
+    }
     updateEmpty();
-    // Fill in on-chain status/progress; unreadable curves (other generations/launchpads) are dropped.
-    const fill = async (r: (typeof rows)[number], card: HTMLElement) => {
-      const { state, name, symbol } = await readRowState(r.curve);
-      if (token !== routeToken) return;
-      const ours = isOrbitPadLaunch(state);
-      card.classList.add("ready-row");
-      card.classList.toggle("ours", ours);
-      card.querySelector("[data-f=name]")!.textContent = name;
-      card.querySelector("[data-f=sym]")!.textContent = `$${symbol}${ours ? "" : ` · Config #${state.configId}`}`;
-      card.querySelector("[data-f=status]")!.innerHTML = statusPill(statusLabel(state.status));
-      card.querySelector("[data-f=bar]")!.innerHTML = progressBar(progressOf(state));
-      card.querySelector("[data-f=pct]")!.textContent = progressSummary(state);
-      card.hidden = false;
-    };
-    const showRetry = (r: (typeof rows)[number], card: HTMLElement) => {
-      card.classList.add("ready-row");
-      card.classList.toggle("ours", r.configId === platformConfigId());
-      card.querySelector("[data-f=name]")!.textContent = short(r.token);
-      card.querySelector("[data-f=sym]")!.textContent = `Config #${r.configId}`;
-      card.querySelector("[data-f=pct]")!.innerHTML = `RPC busy — <button type="button" class="icon small" data-retry>Retry</button>`;
-      card.hidden = false;
-      card.querySelector("[data-retry]")!.addEventListener("click", async e => {
-        e.preventDefault();
-        e.stopPropagation();
-        card.querySelector("[data-f=pct]")!.textContent = "Loading…";
-        try { await fill(r, card); } catch (error) { if (isRpcError(error)) showRetry(r, card); else card.remove(); }
-      });
-    };
-    // Fill in on-chain status/progress; unreadable curves (other generations/launchpads) are dropped,
-    // while transient RPC failures keep the card with a Retry button.
-    const queue = [...rows];
-    const worker = async () => {
-      for (let r = queue.shift(); r; r = queue.shift()) {
-        if (token !== routeToken) return;
-        const card = list.querySelector<HTMLElement>(`[data-curve="${r.curve}"]`);
-        try {
-          if (card) await fill(r, card);
-        } catch (error) {
-          if (card && isRpcError(error)) showRetry(r, card);
-          else card?.remove();
-        } finally {
-          pending--;
-          updateEmpty();
-        }
-      }
-    };
-    await Promise.all([worker(), worker()]);
-  } catch (error) {
-    if (token !== routeToken) return;
-    list.innerHTML = `<div class="card"><div class="notice warn">Could not load launches: ${esc(errorMessage(error))}</div></div>`;
-  }
+  }, current).then(p => {
+    if (!current()) return;
+    oursStatus = `OrbitPad launches since block ${ORBITPAD_START_BLOCK.toLocaleString("en-US")} · on-chain`;
+  }).catch(error => {
+    if (!current()) return;
+    oursStatus = cards.size ? "OrbitPad launches · couldn't finish updating (RPC busy), showing what's loaded" : "";
+    if (!cards.size) list.insertAdjacentHTML("afterbegin", `<div class="card" data-scope="orbitpad"><div class="notice warn">Could not load OrbitPad launches: ${esc(errorMessage(error))}</div></div>`);
+  }).finally(() => {
+    oursLoading = false;
+    if (!current()) return;
+    showStatus();
+    updateEmpty();
+  });
+
+  // 2. All tab: the recent window, as before.
+  const all = recentLaunches(40).then(({ rows, source }) => {
+    if (!current()) return;
+    allStatus = source === "api" ? "via Ammora Data API" : "via on-chain events";
+    rows.forEach(r => addRow(r, true, false));
+  }).catch(error => {
+    if (!current()) return;
+    allStatus = "";
+    list.insertAdjacentHTML("beforeend", `<div class="card" data-scope="all"><div class="notice warn">Could not load recent launches: ${esc(errorMessage(error))}</div></div>`);
+  }).finally(() => {
+    allLoading = false;
+    if (!current()) return;
+    showStatus();
+    updateEmpty();
+  });
+  await Promise.all([ours, all]);
 }
 
 // ---------- Launch ----------
